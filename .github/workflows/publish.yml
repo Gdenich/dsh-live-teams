@@ -1,0 +1,37 @@
+name: publish
+
+# Publishing is a tag, never a push to a branch: `npm version patch -m "Release %s"` writes an
+# annotated tag, and only an annotated tag reaches this workflow (`git push --follow-tags` skips a
+# lightweight one, silently).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write          # provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Tag must match the manifest version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(node -p "require('./package.json').version")"
+          [ "$tag" = "$version" ] || { echo "tag $GITHUB_REF_NAME != $version" >&2; exit 1; }
+      - name: Install
+        run: npm install --no-audit --no-fund
+      - name: Tests must pass on a fresh clone
+        run: npm test
+      - name: Tarball carries only the runtime files
+        run: npm publish --dry-run
+      - name: Publish
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

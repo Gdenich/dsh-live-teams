@@ -1,0 +1,25 @@
+# Optional mount for the DSH Live Teams host half.
+#
+# The row stays disabled unless the composition explicitly enables it, so a
+# profile that merely depends on this package never runs team coordination.
+# `webServer` is used for the read-only Team tab snapshot route; the host half
+# tolerates its absence so a headless composition still mounts.
+- insert:
+    - id: live-teams
+      name: dsh-live-teams
+      disabled: !!js process.env.DSH_LIVE_TEAMS !== '1'
+      inject: [sessionController, sessions, agents, systemPrompt, workspaceRegistry]
+      config:
+        enabled: !!js process.env.DSH_LIVE_TEAMS === '1'
+        workspacePath: !!js process.env.DSH_LIVE_TEAMS_WORKSPACE
+        workspaceId: !!js process.env.DSH_LIVE_TEAMS_WORKSPACE_ID
+        teamId: !!js process.env.DSH_LIVE_TEAMS_TEAM_ID
+        teamName: !!js process.env.DSH_LIVE_TEAMS_TEAM_NAME
+        # Unattended coding stays refused unless a stand explicitly accepts it: it
+        # needs the worktree isolation ADR 0008 has not built (design §22).
+        codingDispatch: !!js process.env.DSH_LIVE_TEAMS_CODING === 'automatic' ? 'automatic' : 'manual'
+        # B32: how the scope record observes the workspace. `auto` (the default) uses git in a
+        # work tree and tree fingerprints in a plain folder; the explicit values exist for a
+        # repository whose status is unusable, and for exercising the fingerprint path in a
+        # repository during verification.
+        scopeMode: !!js process.env.DSH_LIVE_TEAMS_SCOPE_MODE ?? 'auto'

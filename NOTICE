@@ -1,0 +1,11 @@
+dsh-live-teams
+Copyright 2026
+
+This product includes software adapted from dsh-context v0.52.1
+(https://github.com/bowenliang123/dsh-context), Copyright 2025 bowenliang123,
+licensed under the Apache License, Version 2.0.
+
+The Team tab's card geometry, type scale and interaction patterns are transcribed
+and modified from that project. The coordination model, the durable task store, the
+dispatcher, the review transaction and the Git-bound submission flow are original
+to dsh-live-teams.

@@ -1,0 +1,25 @@
+export default {
+  entry: 'src/client/index.ts',
+  outDir: 'lib',
+  format: 'cjs',
+  platform: 'browser',
+  target: 'es2022',
+  fixedExtension: false,
+  dts: false,
+  sourcemap: false,
+  clean: false,
+  external: [
+    'react',
+    'react/jsx-runtime',
+    'react-dom',
+    'react-dom/client',
+    '@deepseek-ai/cordis',
+    /^@deepseek-ai\/dsh-client-/,
+  ],
+  outputOptions: {
+    entryFileNames: 'client.js',
+    banner: 'window.__ModuleLoader__.load({ id: "dsh-live-teams", factory: (require) => {',
+    footer: 'return module.exports; } });',
+    intro: 'var module = { exports: {} }; var exports = module.exports;',
+  },
+}
