@@ -98,16 +98,30 @@ Or install from GitHub:
 dsh plugin --profile <profile> add github:Gdenich/dsh-live-teams
 ```
 
-The Cordis row is **disabled unless explicitly enabled**. Set these environment variables for the DSH
-process, then restart DSH:
+The package's Cordis patch inserts the row **disabled**. Installing the package must not start team
+coordination by itself. Enable it in the profile, after the bundle layers:
 
-```bash
-export DSH_LIVE_TEAMS=1
-export DSH_LIVE_TEAMS_WORKSPACE=/absolute/path/to/your/project
-# optional:
-# export DSH_LIVE_TEAMS_TEAM_NAME="My team"
-# export DSH_LIVE_TEAMS_CODING=automatic
+```yaml
+# ~/.dsh/profiles/<profile>/cordis.patch.yml
+- id: live-teams
+  disabled: false
+  config:
+    enabled: true
+    # optional:
+    # workspacePath: /absolute/path/to/your/project
+    # codingDispatch: automatic
 ```
+
+Then restart DSH. The profile layer is applied after every bundle layer; this override is enough.
+Do not copy the package's own `insert` row into the profile.
+
+Without `workspacePath`, the team is resolved from each Session's cwd, so one profile can serve
+several workspaces. With it, the profile is pinned to one workspace.
+
+If you launch DSH from a terminal, the package row also accepts environment variables:
+`DSH_LIVE_TEAMS=1`, `DSH_LIVE_TEAMS_WORKSPACE`, `DSH_LIVE_TEAMS_TEAM_NAME`,
+`DSH_LIVE_TEAMS_CODING`, and `DSH_LIVE_TEAMS_SCOPE_MODE`. A Desktop app launched from Finder does
+not inherit shell exports; use the profile row there.
 
 Open the workspace in DSH Desktop and select the **Team** tab.
 
@@ -124,15 +138,15 @@ Open the workspace in DSH Desktop and select the **Team** tab.
 
 ## Configuration
 
-| Variable | Meaning | Default |
-|---|---|---|
-| `DSH_LIVE_TEAMS` | Enables the plugin row | off |
-| `DSH_LIVE_TEAMS_WORKSPACE` | Absolute workspace path pinned to this team | Session workspace resolution |
-| `DSH_LIVE_TEAMS_WORKSPACE_ID` | Workspace id, when the workspace is already registered | derived |
-| `DSH_LIVE_TEAMS_TEAM_ID` | Stable team id | derived from the workspace |
-| `DSH_LIVE_TEAMS_TEAM_NAME` | Display name | workspace name |
-| `DSH_LIVE_TEAMS_CODING` | `automatic` allows the dispatcher to start coding tasks; `manual` only starts non-coding work | `manual` |
-| `DSH_LIVE_TEAMS_SCOPE_MODE` | `auto`, `git`, or `files` — how changed paths are observed | `auto` |
+| Profile key | Environment | Meaning | Default |
+|---|---|---|---|
+| `enabled` | `DSH_LIVE_TEAMS` | Enables the plugin row | `false` |
+| `workspacePath` | `DSH_LIVE_TEAMS_WORKSPACE` | Absolute workspace path pinned to this team | Session cwd |
+| `workspaceId` | `DSH_LIVE_TEAMS_WORKSPACE_ID` | Workspace id, when the workspace is already registered | derived |
+| `teamId` | `DSH_LIVE_TEAMS_TEAM_ID` | Stable team id | derived from the workspace |
+| `teamName` | `DSH_LIVE_TEAMS_TEAM_NAME` | Display name | workspace name |
+| `codingDispatch` | `DSH_LIVE_TEAMS_CODING` | `automatic` allows the dispatcher to start coding tasks; `manual` only starts non-coding work | `manual` |
+| `scopeMode` | `DSH_LIVE_TEAMS_SCOPE_MODE` | `auto`, `git`, or `files` — how changed paths are observed | `auto` |
 
 Team state, tasks, submissions, reviews, and the activity journal are stored under
 `<workspace>/.dsh-live-teams`. Do not edit those files by hand: the plugin validates and locks them.
