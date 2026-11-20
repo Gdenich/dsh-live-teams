@@ -13,6 +13,16 @@
  */
 export declare const CHANGED_PATHS_LIMIT = 2000;
 export declare function parsePorcelainZ(stdout: string): string[] | undefined;
+/**
+ * What the member *committed* during its attempt.
+ *
+ * `git status` shows uncommitted work only, so a member that commits — which is what a careful
+ * engineer does, and what the repository's own conventions ask for — looked like it had changed
+ * nothing, and a report submission was refused with "nothing changed under the declaration" (found
+ * by a Builder on a real stand). The work is the union: what is still in the tree, and what was
+ * committed since the attempt took its base.
+ */
+export declare function gitCommittedPaths(workspacePath: string, base: string): Promise<string[] | undefined>;
 export declare function gitChangedPaths(workspacePath: string): Promise<string[] | undefined>;
 /**
  * B32: which observation a workspace supports.

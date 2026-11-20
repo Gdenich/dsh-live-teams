@@ -41,7 +41,7 @@ describe('pilot finding F1: the submit tool states its artifact shape', () => {
   // member invented its own keys, the refusal named a branch it never chose, and it
   // went looking for the error text on disk. A refusal has to name both accepted
   // shapes and what actually arrived.
-  function setupWithStore(submitted: unknown[]): ToolDefinition[] {
+  function setupWithStore(submitted: unknown[], notifications: unknown[] = []): ToolDefinition[] {
     const tools: ToolDefinition[] = []
     const binding = {
       mailbox: fakeMailbox([], []),
@@ -50,7 +50,7 @@ describe('pilot finding F1: the submit tool states its artifact shape', () => {
       member,
       team,
       live: (candidate: MemberRecord) => candidate.sessionId !== undefined,
-      taskStore: { submitTask: async (request: unknown) => { submitted.push(request); return { submission: { id: 'submission-1' } } } },
+      taskStore: { submitTask: async (request: unknown) => { submitted.push(request); return { submission: { id: 'submission-1' }, notifications } } },
     } as unknown as MemberToolsBinding
     registerMemberTools({ register: (tool) => { tools.push(tool); return undefined } }, async () => binding, { includeReview: true })
     return tools
@@ -66,17 +66,49 @@ describe('pilot finding F1: the submit tool states its artifact shape', () => {
     expect(failure).toContain('changed_paths')
   })
 
+  it('accepts the declared shape when the member spelled it with stray whitespace', async () => {
+    // The parameter is an opaque `json`, so the host validates nothing and the member's own spelling
+    // arrives. A trailing newline after "report" is the same submission — refusing it blocked a real
+    // task on a live stand and cost the member a long explanation.
+    const submitted: unknown[] = []
+    const tools = setupWithStore(submitted)
+    const result = await submit(tools).execute({ taskId: 't-1', summary: 's', artifact: { type: 'report\n', bodyRef: ' report.md ' }, checks: [] }, execution('s-worker'))
+    expect(result).toBeDefined()
+  })
+
+  it('accepts an artifact sent as a JSON string', async () => {
+    const tools = setupWithStore([])
+    const result = await submit(tools).execute({ taskId: 't-1', summary: 's', artifact: JSON.stringify({ type: 'files', paths: ['a.py'] }), checks: [] }, execution('s-worker'))
+    expect(result).toBeDefined()
+  })
+
+  it('names the value it saw, not only the keys', async () => {
+    const tools = setupWithStore([])
+    // The refusal rejects, as the neighbouring test shows: capture the message the same way.
+    const failure = await submit(tools).execute({ taskId: 't-1', summary: 's', artifact: { type: 'Reports', bodyRef: 'r.md' }, checks: [] }, execution('s-1'))
+      .then(() => undefined, (error: unknown) => (error instanceof Error ? error.message : String(error)))
+    expect(failure).toContain('"type" was "Reports"')
+  })
+
   it('says what a files artifact is missing instead of complaining about an empty path list', async () => {
     const tools = setupWithStore([])
     await expect(submit(tools).execute({ taskId: 't-1', summary: 's', artifact: { type: 'files', paths: [] } }, execution('s-1'))).rejects.toThrow(/non-empty "paths"/u)
     await expect(submit(tools).execute({ taskId: 't-1', summary: 's', artifact: { type: 'report' } }, execution('s-1'))).rejects.toThrow(/needs a string "bodyRef"/u)
   })
 
+  it('preserves per-recipient admission receipts in the actual submit tool response', async () => {
+    const notifications = [{ recipient: 'lead', purpose: 'lead-acceptance', state: 'queued', messageId: 'notice1', requestId: 'request1' }]
+    const tools = setupWithStore([], notifications)
+    const result = await submit(tools).execute({ taskId: 't-1', summary: 'done', artifact: { type: 'report', bodyRef: 'report.md' }, checks: [] }, execution('s-1'))
+    expect(result).toEqual({ submission: { id: 'submission-1' }, notifications })
+    expect(JSON.stringify(submit(tools).output)).toContain('notifications')
+  })
+
   it('still submits a well-formed artifact', async () => {
     const submitted: unknown[] = []
     const tools = setupWithStore(submitted)
     const result = await submit(tools).execute({ taskId: 't-1', summary: 'done', artifact: { type: 'files', paths: ['packages/alpha/src/slugify.js'] }, checks: [{ command: 'npm test', status: 'passed' }] }, execution('s-1'))
-    expect(result).toEqual({ submission: { id: 'submission-1' } })
+    expect(result).toEqual({ submission: { id: 'submission-1' }, notifications: [] })
     expect(submitted[0]).toMatchObject({ artifact: { type: 'files', paths: ['packages/alpha/src/slugify.js'] } })
   })
 })

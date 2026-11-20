@@ -8,14 +8,20 @@ import { ERROR_CODES, LiveTeamsError } from './errors.js'
 import { checkCompatibility } from './compatibility.js'
 import { resolveLeadMemberId, TeamStore, readDispatchSwitch, readMemberBySessionSync, readTeamStateSync, type ContactTarget, type MemberRecord, type TeamState } from './team-store.js'
 import { readRoleRegistry, readRoleRegistrySync, type RoleRegistry } from './roles.js'
-import { createSessionBridge, type SessionBridge, type SessionDescriptor } from './session-bridge.js'
+import { createSessionBridge, type SessionBridge, type SessionDescriptor, type SessionQuerySource } from './session-bridge.js'
 import { createCommandQueue, type CommandRecord, type SessionCommandQueue } from './command-queue.js'
 import { createMailbox, type MailboxRecipient, type MailboxService } from './mailbox.js'
+import { createReviewReturnPorts, reviewReturnLeadDeliveryAllowed } from './review-return-ports.js'
+import { createReviewReturnGuard } from './review-return-guard.js'
+import { assignmentDeliveryAllowed } from './assignment-guard.js'
+import { createAssignmentRecovery } from './assignment-recovery.js'
+import { createSubmissionNoticePort, submissionNoticeDeliveryAllowed } from './submission-notice-ports.js'
+import { createLifecycleNoticePort, lifecycleNoticeDeliveryAllowed } from './lifecycle-notice.js'
 import { createDispatcher, projectDispatch, type CodingDispatch, type Dispatcher, type ReconcileResult } from './dispatch.js'
 import { createMembershipContextProvider, type MembershipContextBinding, type MembershipContextProvider } from './context-provider.js'
 import { registerMemberToolsIfAvailable } from './member-tools.js'
-import { createTaskStore, routeAllowsContact, type TaskStore } from './task-store.js'
-import { gitChangedPaths, workspaceMode } from './changed-paths.js'
+import { createTaskStore, permittedContacts, type TaskStore } from './task-store.js'
+import { gitChangedPaths, gitCommittedPaths, workspaceMode } from './changed-paths.js'
 import { snapshotTree } from './tree-snapshot.js'
 import { baseInfo, commitPaths, commitPathsOf, integrateCommit, pinCommit, refTip } from './git-artifacts.js'
 import { assertSessionDescriptorInTeamWorkspace, assertSessionInTeamWorkspace } from './binding.js'
@@ -73,6 +79,9 @@ type HostContext = {
   get?: (name: string) => unknown
   sessionController: Parameters<typeof createSessionBridge>[0]['controller'] & NativePathController
   agents?: AgentRegistry
+  sessions?: { get?: (sessionId: string) => unknown }
+  /** Provided by the host through `ctx.inject`; not visible through a bare `ctx.get` here. */
+  sessionQuery?: SessionQuerySource
   systemPrompt: { context: (definition: ReturnType<MembershipContextProvider['definition']>) => unknown }
   provide: (key: string, value: LiveTeamsService) => unknown
   logger?: { warn?: (message: string) => void }
@@ -145,7 +154,26 @@ export function apply(ctx: HostContext, config: PluginConfig = {}): void {
     bindingsByWorkspaceId.clear()
     await Promise.all(stopping)
   }, 'live-teams-host.dispose')
-  const bridge = createSessionBridge(ctx.agents === undefined ? { controller: ctx.sessionController } : { controller: ctx.sessionController, agents: ctx.agents })
+  // DSH 0.2.2-rc.1 removed sessionController.inspect; sessionQuery.load reads the same header and
+  // events. `ctx.get` does not cross the service isolation here (the first lazy build still logged
+  // "neither inspect nor sessionQuery.load"), so the official injection seam is used and the live
+  // Session service remains the fallback for a freshly created member.
+  let queryService: SessionQuerySource | undefined
+  const sessionQuery = (): SessionQuerySource | undefined => queryService
+  if (typeof ctx.inject === 'function') {
+    try {
+      ctx.inject(['sessionQuery'], (injected) => {
+        queryService = (injected as HostContext).sessionQuery
+      })
+    } catch { /* older host without the service */ }
+  }
+  const liveSession = ctx.sessions?.get === undefined ? undefined : (sessionId: string) => ctx.sessions?.get?.(sessionId)
+  const bridge = createSessionBridge({
+    controller: ctx.sessionController,
+    ...(ctx.agents === undefined ? {} : { agents: ctx.agents }),
+    sessionQuery,
+    ...(liveSession === undefined ? {} : { liveSession }),
+  })
 
   function registryEntries(): WorkspaceEntry[] {
     try { return ctx.workspaceRegistry?.list?.() ?? [] } catch (error) {
@@ -205,7 +233,7 @@ export function apply(ctx: HostContext, config: PluginConfig = {}): void {
     let dispatcher: Dispatcher | undefined
     /** Resolves once this binding has looked for its own team under another workspace id. */
     let adoption: Promise<unknown> = Promise.resolve()
-    const taskStore = createTaskStore({ workspacePath, teamId: input.teamId, appendAudit: async (event) => { await audit(event as Record<string, unknown>) }, changedPaths: gitChangedPaths,
+    const taskStore = createTaskStore({ workspacePath, teamId: input.teamId, deliverLifecycleNotice: createLifecycleNoticePort({ mailbox: () => escalationMailbox, teamId: input.teamId }), deliverSubmissionNotice: createSubmissionNoticePort({ mailbox: () => escalationMailbox, teamId: input.teamId }), ...createReviewReturnPorts({ mailbox: () => escalationMailbox, bridge, teamId: input.teamId }), appendAudit: async (event) => { await audit(event as Record<string, unknown>) }, changedPaths: gitChangedPaths, committedPaths: gitCommittedPaths,
     workspaceMode: async (candidate: string) => {
       if (config.scopeMode === 'git') return 'git' as const
       if (config.scopeMode === 'files') return 'files' as const
@@ -228,6 +256,14 @@ export function apply(ctx: HostContext, config: PluginConfig = {}): void {
     }, deliverClosing: async ({ assignee, taskId, note }) => {
       if (escalationMailbox === undefined) return
       await escalationMailbox.sendFromScheduler({ to: assignee, kind: 'message', content: `The work is accepted, await the next task. Task ${taskId} is archived.${note === undefined || note.trim().length === 0 ? '' : ` Lead note: ${note.trim()}`}` })
+    }, deliverCancellation: async ({ assignee, taskId, reason }) => {
+      if (escalationMailbox === undefined) return
+      await escalationMailbox.sendFromScheduler({ to: assignee, kind: 'message', content: `Task ${taskId} was cancelled without accepting its work. Reason: ${reason}. Await the next task.` })
+    }, deliverReviewRequest: async ({ reviewer, assignee, taskId, submissionId, summary }) => {
+      if (escalationMailbox === undefined) return
+      // The scheduler's message is queued, so the dispatcher wakes the reviewer's Session — the same
+      // path that starts a member on an assignment. Without it the reviewer simply sleeps.
+      await escalationMailbox.sendFromScheduler({ to: reviewer, kind: 'message', content: `task ${taskId} was submitted for review by ${assignee}: ${submissionId}. Summary: ${summary}` })
     }, deliverDirection: async ({ assignee, taskId, instructions }) => {
       if (escalationMailbox === undefined) return
       await escalationMailbox.sendFromScheduler({ to: assignee, kind: 'direction', content: `Lead direction for task ${taskId}: ${instructions}` })
@@ -364,13 +400,25 @@ export function apply(ctx: HostContext, config: PluginConfig = {}): void {
       await store.appendEvent(input.teamId, { kind: 'team/renamed', teamId: input.teamId, from: renamed.from, to: requestedName, at: Date.now(), actor: 'human:desktop' })
       return { from: renamed.from, status: { enabled: true, teamId: input.teamId, teamName: requestedName, workspacePath, revision: renamed.state.revision, memberCount: renamed.state.members.length } }
     }
+    const returnDeliveryAllowed = createReviewReturnGuard({
+      store: taskStore, bridge,
+      readEvents: async () => (await (await ensureStore()).readEvents(input.teamId, 0)).events,
+      knownRequestIds: async (sessionId) => (await queue.list()).filter(record => record.sessionId === sessionId).map(record => record.requestId),
+    })
     const queue = createCommandQueue({
       workspacePath, teamId: input.teamId,
-      deliver: async (record: CommandRecord) => { if (disposing) throw new LiveTeamsError(ERROR_CODES.PLUGIN_DISPOSING, 'the plugin is disposing'); return bridge.deliver(record.sessionId, { requestId: record.requestId, mode: record.mode, content: record.content }) },
+      deliver: async (record: CommandRecord) => {
+        if (disposing) throw new LiveTeamsError(ERROR_CODES.PLUGIN_DISPOSING, 'the plugin is disposing')
+        const message = record.causationId === undefined ? undefined : await mailbox.getMessage(record.causationId)
+        if (record.causationId !== undefined && message === undefined) throw new LiveTeamsError(ERROR_CODES.DELIVERY_REJECTED, 'mailbox causation is unavailable')
+        if (message !== undefined && (!await assignmentDeliveryAllowed(taskStore, message, record.sessionId, record.bindingGeneration) || !await submissionNoticeDeliveryAllowed(taskStore, message, record.sessionId, record.bindingGeneration) || !await lifecycleNoticeDeliveryAllowed(taskStore, message, record.sessionId, record.bindingGeneration) || !await reviewReturnLeadDeliveryAllowed(taskStore, message, record.sessionId, record.bindingGeneration) || !await returnDeliveryAllowed(message, record.sessionId, record.bindingGeneration))) throw new LiveTeamsError(ERROR_CODES.DELIVERY_REJECTED, 'scheduler task notification is no longer current')
+        return bridge.deliver(record.sessionId, { requestId: record.requestId, mode: record.mode, content: record.content })
+      },
       bindingGenerationOf: async (sessionId: string) => (await storeFacade.memberBySession(input.teamId, sessionId))?.bindingGeneration,
     })
     const mailbox = createMailbox({
       workspacePath, teamId: input.teamId, queue,
+      canDeliver: async (message, recipient) => await assignmentDeliveryAllowed(taskStore, message, recipient.sessionId, recipient.bindingGeneration) && await submissionNoticeDeliveryAllowed(taskStore, message, recipient.sessionId, recipient.bindingGeneration) && await lifecycleNoticeDeliveryAllowed(taskStore, message, recipient.sessionId, recipient.bindingGeneration) && await reviewReturnLeadDeliveryAllowed(taskStore, message, recipient.sessionId, recipient.bindingGeneration) && await returnDeliveryAllowed(message, recipient.sessionId, recipient.bindingGeneration),
       authorize: async ({ from, to }) => {
         const state = await ensureStore().then((current) => current.open())
         // Membership is decided before the name is: a member whose id happens to be `human` is a
@@ -382,8 +430,9 @@ export function apply(ctx: HostContext, config: PluginConfig = {}): void {
         const sender = state.members.find((member) => member.memberId === from)
         if (sender === undefined) throw new LiveTeamsError(ERROR_CODES.CAPABILITY_UNAVAILABLE, 'calling session is not bound to an active team member')
         const leadId = resolveLeadMemberId(state)
-        const derived = (await taskStore.listTasks()).some((task) => routeAllowsContact(task, sender.memberId, to, state))
-        if (to === sender.memberId || to === leadId || sender.memberId === leadId || state.contactGrants?.some((grant) => grant.from === sender.memberId && grant.to === to) === true || (to !== 'team' && derived)) return
+        // The same function the panel and the context use. Three copies of this rule drifted once
+        // already: the panel told the lead that contact was not allowed while the mailbox delivered.
+        if (to === sender.memberId || permittedContacts(state, sender.memberId, await taskStore.listTasks()).includes(to)) return
         const target = to === 'human' || to === 'team' ? to : state.members.find((member) => member.memberId === to)?.displayName ?? to
         if (leadId === undefined) throw new LiveTeamsError(ERROR_CODES.CAPABILITY_UNAVAILABLE, `Not permitted to address ${target}: this team has no lead. Ask the human to set one in the Team tab.`)
         throw new LiveTeamsError(ERROR_CODES.CAPABILITY_UNAVAILABLE, `Not permitted to address ${target}: peer contact is granted by your lead.\nSend this to your lead instead — the lead holds the project context and decides\nwhether a conversation with ${target} is warranted.`)
@@ -435,6 +484,12 @@ export function apply(ctx: HostContext, config: PluginConfig = {}): void {
       })
     }
 
+    const recoverObsoleteAssignments = createAssignmentRecovery({
+      teamId: input.teamId, store: taskStore, bridge,
+      listMessages: async () => mailbox.listMessages(),
+      listCommands: async () => queue.list(),
+      appendAudit: async event => { await audit(event) },
+    })
     let explainedInactive = false
     dispatcher = createDispatcher({
       workspacePath,
@@ -445,6 +500,10 @@ export function apply(ctx: HostContext, config: PluginConfig = {}): void {
       appendAudit: async (event) => { await audit(event as unknown as Record<string, unknown>) },
       codingDispatch,
       humanActivity,
+      recoverReviewReturns: async () => taskStore.recoverReviewReturns(),
+      recoverSubmissionNotifications: async () => taskStore.recoverSubmissionNotifications(),
+      recoverLifecycleNotifications: async () => taskStore.recoverLifecycleNotifications(),
+      recoverObsoleteAssignments,
       ...(sharedPaths.length === 0 ? {} : { sharedPaths }),
     gitTip: async (ref: string) => await refTip(workspacePath, ref),
       // A pass that refuses to run says which team it thinks is inactive: a wrong
@@ -475,7 +534,17 @@ export function apply(ctx: HostContext, config: PluginConfig = {}): void {
         ctx.logger?.warn?.(`live-teams: could not adopt a team for ${workspacePath}: ${error instanceof Error ? error.message : String(error)}`)
         return undefined
       })
-    void adoption.then(() => { dispatcher?.start() })
+    void adoption.then(async () => {
+      // State written by an older build is brought forward once, before anything reads or writes it.
+      // This call was lost once: it was edited in, never committed, and a restart therefore migrated
+      // nothing while the panel kept showing a task that could not be accepted.
+      const migrated = await taskStore.migrate().catch((error: unknown) => {
+        ctx.logger?.warn?.(`live-teams: state migration refused: ${error instanceof Error ? error.message : String(error)}`)
+        return undefined
+      })
+      if (migrated !== undefined && migrated.files.length > 0) ctx.logger?.warn?.(`live-teams: migrated ${migrated.files.map((file) => `${file.file} ${file.from}→${file.to}`).join(', ')}`)
+      dispatcher?.start()
+    })
     /** The projection the panel, the lead's tool and the journal all read from. */
     const readDispatchProjection = async (): Promise<LiveTeamsDispatch> => {
       const state = await (await ensureStore()).open()
@@ -530,7 +599,11 @@ export function apply(ctx: HostContext, config: PluginConfig = {}): void {
     const routeOptions: LiveTeamsRouteOptions = {
       teamId: input.teamId,
       compatibility: () => compatibility,
-      setLead: async (memberId, expectedRevision) => { const state = await store.setLead(input.teamId, memberId, expectedRevision); return { state, leadMemberId: memberId } },
+      setLead: async (memberId, expectedRevision) => {
+        const state = await store.setLead(input.teamId, memberId, expectedRevision)
+        // The store's own state, not the request: clearing has to come back as cleared.
+        return { state, ...(state.leadMemberId === undefined ? {} : { leadMemberId: state.leadMemberId }) }
+      },
       setContactGrant: async (from, to, action, actor) => {
         const result = await store.updateContactGrant(input.teamId, from, to as ContactTarget, action, actor)
         if (result.changed) await store.appendEvent(input.teamId, { kind: action === 'add' ? 'contact/granted' : 'contact/revoked', from, to, actor, at: Date.now() })
@@ -563,7 +636,16 @@ export function apply(ctx: HostContext, config: PluginConfig = {}): void {
       listCandidates: async (): Promise<readonly SessionDescriptor[]> => {
         const controller = ctx.sessionController
         if (controller === undefined || controller === null || typeof controller.list !== 'function') return []
-        const listed = await controller.list({}, new AbortController().signal)
+        // A host call with no deadline is a hung panel: the listing feeds the add-member dialog, and
+        // a profile with dozens of Sessions can take long enough that the human sees a dead button.
+        const controllerAbort = new AbortController()
+        const timer = setTimeout(() => controllerAbort.abort(), 8000)
+        let listed: unknown
+        try {
+          listed = await controller.list({}, controllerAbort.signal)
+        } catch (error) {
+          throw new LiveTeamsError(ERROR_CODES.CAPABILITY_UNAVAILABLE, `the host did not list Sessions within 8s: ${error instanceof Error ? error.message : String(error)}`, { auditDetail: 'session listing timed out' })
+        } finally { clearTimeout(timer) }
         const value = listed !== null && typeof listed === 'object' && !Array.isArray(listed) ? listed as { items?: unknown } : {}
         if (!Array.isArray(value.items)) return []
         const descriptors: SessionDescriptor[] = []
@@ -672,7 +754,15 @@ export function apply(ctx: HostContext, config: PluginConfig = {}): void {
       readEvents: async (after?: number): Promise<{ events: readonly unknown[]; torn: string | null; nextOffset: number; truncated: boolean }> => await (await ensureStore()).readEvents(input.teamId, after),
       interrupt: (sessionId, reason) => bridge.interrupt(sessionId, reason),
     }
-    const contextProvider = createMembershipContextProvider({ store: storeFacade, teamId: input.teamId, teamName: teamNameSync, workspacePath, enabled: enabledSync, roleRegistry: { resolve: resolveRoleSync }, formalToolsAvailable: toolRuntime !== undefined, live: (member) => member.sessionId !== undefined && ctx.agents?.get?.(member.sessionId) !== undefined, commentsSync: (_teamId, memberId) => mailbox.unreadCommentsForSync(memberId), onError: (error) => ctx.logger?.warn?.(`live-teams: membership context unavailable: ${String(error)}`) })
+    const contextProvider = createMembershipContextProvider({ store: storeFacade, teamId: input.teamId, teamName: teamNameSync, workspacePath, enabled: enabledSync, roleRegistry: { resolve: resolveRoleSync }, formalToolsAvailable: toolRuntime !== undefined, live: (member) => member.sessionId !== undefined && ctx.agents?.get?.(member.sessionId) !== undefined, commentsSync: (_teamId, memberId) => mailbox.unreadCommentsForSync(memberId),
+      // The route decides how the team tools are named: through the oh-my-claude bridge they arrive
+      // as mcp__dsh__live_team_*. Read from the agent the same way its status is read.
+      routeOf: (member) => {
+        if (member.sessionId === undefined) return undefined
+        const agent = ctx.agents?.get?.(member.sessionId) as { model?: unknown } | undefined
+        const model = agent?.model
+        return typeof model === 'string' && model.length > 0 ? model : undefined
+      }, onError: (error) => ctx.logger?.warn?.(`live-teams: membership context unavailable: ${String(error)}`) })
     const binding: Binding = { path: workspacePath, id: input.id, teamId: input.teamId, teamName: input.teamName, store, taskStore, storeFacade, contextBinding, contextProvider, routeOptions, queue, mailbox, dispatcher, adoption, readDispatch: readDispatchProjection, setDispatch: setDispatchMode, ensureStore }
     bindingsByWorkspaceId.set(input.id, binding)
     return binding

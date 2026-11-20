@@ -7,7 +7,7 @@ import { HOST_CAPABILITIES, checkCompatibility } from './compatibility.js'
  * line saying what broke.
  */
 describe('host compatibility', () => {
-  const full = { sessionController: { create: () => undefined }, agents: { get: () => undefined }, systemPrompt: {}, workspaceRegistry: {}, tools: { register: () => undefined }, webServer: { register: () => undefined } }
+  const full = { sessionController: { create: () => undefined, inspect: () => undefined }, agents: { get: () => undefined }, systemPrompt: {}, workspaceRegistry: {}, tools: { register: () => undefined }, webServer: { register: () => undefined } }
 
   it('is compatible when the host offers everything the plugin calls', () => {
     const verdict = checkCompatibility(full, { hostVersion: '0.1.5-rc.2', declared: ['0.1.5-rc.2'] })

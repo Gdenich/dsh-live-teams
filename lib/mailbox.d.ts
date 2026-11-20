@@ -170,6 +170,8 @@ export type MailboxOptions = {
   /** Optional policy gate, called before any mailbox row is persisted. */
   authorize?: (request: MailboxAuthorizeRequest) => void | Promise<void>;
   resolveSessionSender?: (sessionId: string) => Promise<string | undefined> | string | undefined;
+  /** Durable guarded scheduler traffic must still be authorized on background retries. */
+  canDeliver?: (message: TeamMessage, recipient: MailboxRecipient) => Promise<boolean>;
   appendAudit?: (event: MailboxAuditEvent) => Promise<void>;
   now?: () => number;
   leaseMs?: number;
@@ -194,6 +196,7 @@ export declare class MailboxService {
   private readonly listRecipients;
   private readonly authorize;
   private readonly resolveSessionSender;
+  private readonly canDeliver;
   private readonly appendAudit;
   private readonly now;
   private readonly leaseMs;
@@ -220,6 +223,8 @@ export declare class MailboxService {
   sendFromSession(sessionId: string, draft: MessageDraft): Promise<SendResult>;
   sendFromHuman(draft: MessageDraft): Promise<SendResult>;
   sendFromScheduler(draft: MessageDraft): Promise<SendResult>;
+  /** Internal outbox identity uses the existing immutable thread field; no mailbox schema change. */
+  sendFromSchedulerOnce(draft: MessageDraft): Promise<SendResult>;
   claimDelivery(deliveryId: string): Promise<MessageDelivery | undefined>;
   deliver(deliveryId: string): Promise<MessageDelivery>;
   /**

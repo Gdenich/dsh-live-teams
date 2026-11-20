@@ -24,6 +24,8 @@ type ClientContext = {
     locale: LocaleService;
     sessions: SessionsService;
     effect(effect: () => void | (() => void), name?: string): unknown;
+    /** Cordis throws when a service that was not declared in `inject` is read as a property. */
+    get?(name: string): unknown;
 };
 export declare const name = "dsh-live-teams";
 export declare const inject: readonly ["slots", "locale", "sessions"];

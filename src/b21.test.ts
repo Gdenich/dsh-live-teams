@@ -177,3 +177,41 @@ describe('B21 submission and review contract', () => {
     } finally { await cleanup(value.workspace) }
   })
 })
+
+describe('the reviewer is told when a submission arrives', () => {
+  it('sends the review request along the route the lead froze', async () => {
+    // Handing the submission over used to be the member's job alone: on a live stand one submission
+    // waited six and a half minutes for a human to notice, while the member that did message its
+    // reviewer was accepted in thirty-one seconds. The route is part of the task contract and cannot
+    // be edited once work starts, so the handoff can only go where the lead sent it.
+    const workspace = await mkdtemp(join(tmpdir(), 'live-teams-b21-handoff-'))
+    const sent: { reviewer: string; assignee: string; taskId: string; submissionId: string }[] = []
+    try {
+      const team = new TeamStore({ workspacePath: workspace, workspaceId: 'workspace-1', teamId: 'team-1' })
+      await team.open()
+      // The members the harness's own helper seeds: an assignee and a reviewer must exist.
+      const opened = await team.open()
+      await team.commit('team-1', { expectedRevision: opened.revision, mutate: (value) => Object.assign(value, state()) })
+      const store = createTaskStore({
+        workspacePath: workspace,
+        teamId: 'team-1',
+        appendAudit: async () => undefined,
+        deliverReviewRequest: async (request) => { sent.push(request) },
+      })
+      const created = await store.createTask({ title: 'Handoff', kind: 'research', assignee: 'worker', route: { type: 'review', reviewer: 'reviewer' }, acceptance: ['ok'], actor: 'human:desktop' })
+      await store.claimTask({ taskId: created.task.id, memberId: 'worker', sessionId: 's-worker', bindingGeneration: 1 })
+      const report = join(workspace, 'handoff.md')
+      await writeFile(report, '# handoff\n')
+      const submitted = await store.submitTask({ taskId: created.task.id, memberId: 'worker', sessionId: 's-worker', bindingGeneration: 1, artifact: { type: 'report', bodyRef: 'handoff.md' }, summary: 'ready for review', checks: [] })
+      expect(sent).toHaveLength(1)
+      expect(sent[0]).toMatchObject({ reviewer: 'reviewer', assignee: 'worker', taskId: created.task.id, submissionId: submitted.submission.id })
+
+      // A report route has no reviewer to wake: the human decides, and the panel says so.
+      const humanTask = await store.createTask({ title: 'For the human', kind: 'research', assignee: 'reviewer', route: { type: 'report', to: 'human' }, acceptance: ['ok'], actor: 'human:desktop' })
+      await store.claimTask({ taskId: humanTask.task.id, memberId: 'reviewer', sessionId: 's-reviewer', bindingGeneration: 1 })
+      await writeFile(report, '# human\n')
+      await store.submitTask({ taskId: humanTask.task.id, memberId: 'reviewer', sessionId: 's-reviewer', bindingGeneration: 1, artifact: { type: 'report', bodyRef: 'handoff.md' }, summary: 'for the human', checks: [] })
+      expect(sent).toHaveLength(1)
+    } finally { await rm(workspace, { recursive: true, force: true }) }
+  })
+})

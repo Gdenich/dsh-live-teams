@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { baseInfo, commitPaths, commitPathsOf, integrateCommit, pinCommit, refTip } from './git-artifacts.js'
-import { gitChangedPaths } from './changed-paths.js'
+import { gitChangedPaths, gitCommittedPaths } from './changed-paths.js'
 import { createTaskStore, type TaskStore } from './task-store.js'
 import { TeamStore, type MemberRecord, type TeamState } from './team-store.js'
 
@@ -40,7 +40,7 @@ async function repository(prefix: string): Promise<{ workspace: string; store: T
   const team = new TeamStore({ workspacePath: workspace, workspaceId: 'ws', teamId: 'team-1' })
   await team.open(); const opened = await team.open()
   await team.commit('team-1', { expectedRevision: opened.revision, mutate: (state) => { Object.assign(state, teamState([member('lead', 'lead'), member('worker'), member('reviewer', 'verifier')])) } })
-  const store = createTaskStore({ workspacePath: workspace, teamId: 'team-1', appendAudit: async () => undefined, workspaceMode: async () => 'git' as const, changedPaths: gitChangedPaths, git: gitPorts })
+  const store = createTaskStore({ workspacePath: workspace, teamId: 'team-1', appendAudit: async () => undefined, workspaceMode: async () => 'git' as const, changedPaths: gitChangedPaths, committedPaths: gitCommittedPaths, git: gitPorts })
   return { workspace, store, git }
 }
 
@@ -227,6 +227,20 @@ describe('Phase 6 Git-bound submissions', () => {
       expect(accepted.task.status).toBe('completed')
       expect(accepted.task.integrationPending).toBeUndefined()
       expect(git(['rev-parse', String(git_?.baseRef)]).trim()).toBe(git_?.headSha)
+    } finally { await rm(workspace, { recursive: true, force: true }) }
+  })
+
+  it('refuses a submission with an empty change set and names the way out', async () => {
+    // The message must say what to do: a member that committed its work has a clean tree, and a
+    // report carries no paths. On a real stand a Builder read the plugin's source to find this out.
+    const { workspace, store } = await repository('live-teams-b33-empty-')
+    try {
+      const created = await store.createTask({ title: 'Nothing', kind: 'implementation', assignee: 'worker', route: { type: 'report', to: 'human' }, acceptance: ['ok'], actor: 'lead', paths: ['packages/a/**'] })
+      await store.claimTask({ taskId: created.task.id, memberId: 'worker', sessionId: 's-worker', bindingGeneration: 1 })
+      await mkdir(join(workspace, '.dsh-live-teams', 'reports'), { recursive: true })
+      await writeFile(join(workspace, '.dsh-live-teams', 'reports', `${created.task.id}.md`), '# report\n')
+      await expect(store.submitTask({ taskId: created.task.id, memberId: 'worker', sessionId: 's-worker', bindingGeneration: 1, artifact: { type: 'report', bodyRef: `.dsh-live-teams/reports/${created.task.id}.md` }, summary: 'empty', checks: [] }))
+        .rejects.toThrow(/submit it as a file artifact naming those files/u)
     } finally { await rm(workspace, { recursive: true, force: true }) }
   })
 

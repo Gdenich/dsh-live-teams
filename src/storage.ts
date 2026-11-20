@@ -62,3 +62,16 @@ export function clone<T>(value: T): T {
 }
 
 export const CURRENT_SCHEMA_VERSION = 1
+
+/**
+ * The tasks file has its own version, because it has its own shape.
+ *
+ * 2 — tasks carry `awaitsDecision` (a submission is in and nobody has decided on it). The flag was
+ * added after a live stand showed a task that could be neither accepted nor closed: the store and
+ * the panel both derived the answer from the status, and a returned task is `in_progress` while its
+ * submission is still on the table.
+ *
+ * One constant for every file made the team store expect a version it never wrote, and the host
+ * integration tests caught it. A version belongs to a file.
+ */
+export const TASKS_SCHEMA_VERSION = 2

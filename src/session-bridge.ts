@@ -24,16 +24,34 @@ export interface SessionDescriptor {
 
 export interface SessionController {
   create(payload: Record<string, unknown>): Promise<unknown>
-  inspect(sessionId: string): Promise<unknown>
+  /**
+   * Removed in DSH 0.2.2-rc.1. Kept optional so this bridge still works on older hosts; new
+   * hosts are served through `SessionQuerySource.load`.
+   */
+  inspect?(sessionId: string): Promise<unknown>
   list?(request: Record<string, unknown>, signal?: AbortSignal): Promise<unknown>
   rename(payload: { sessionId: string; title: string }): Promise<unknown>
   prompt(payload: { requestId: string; sessionId: string; mode: 'queue' | 'steer'; content: readonly unknown[] }, signal: AbortSignal): Promise<unknown>
   cancel(payload: { sessionId: string }): void
+  updateQueue?(payload: { sessionId: string; itemId: string; action: { kind: 'remove' } }): Promise<unknown>
 }
 
+export type SessionExecutionReceipt = {
+  state: 'pending' | 'started' | 'completed' | 'failed' | 'unobservable'
+  turn?: number
+  inputSeq?: number
+  reason?: string
+}
+
+export type QueueRemovalReceipt = { state: 'removed' | 'not-pending' | 'unobservable' | 'refused'; itemId?: string; reason?: string }
+
 export interface SessionBridge {
+  removeQueuedRequest(sessionId: string, requestId: string): Promise<QueueRemovalReceipt>
   create(request: { sessionId?: string; workspaceId?: string; cwd?: string; agentPreset?: string }): Promise<SessionDescriptor>
   inspect(sessionId: string): Promise<SessionDescriptor | undefined>
+  /** Observe an exact prompt's turn using metadata only, not generic agent liveness. */
+  observeRequest(sessionId: string, requestId: string): Promise<SessionExecutionReceipt>
+  observeHumanActivity(sessionId: string, since: number, knownRequestIds: readonly string[]): Promise<boolean | undefined>
   validateAttachment(sessionId: string, workspaceId: string): Promise<SessionDescriptor>
   rename(sessionId: string, title: string): Promise<{ title: string; seq: number | undefined }>
   selectModel(sessionId: string, selection: unknown): never
@@ -98,11 +116,92 @@ function descriptorOf(inspection: RecordValue, liveAgent: unknown): SessionDescr
   }
 }
 
-export interface SessionBridgeDeps { controller: SessionController | null | undefined; agents?: { get?: (sessionId: string) => unknown } }
-export function createSessionBridge({ controller, agents }: SessionBridgeDeps): SessionBridge {
+/**
+ * The host's cold-safe Session reader.
+ *
+ * DSH 0.2.2-rc.1 moved inspection off `sessionController` onto `ctx.sessionQuery.load`, which
+ * returns `{ header, inheritedEventCount, events }`. The bridge normalizes both shapes, so a
+ * deployment may upgrade without losing member validation or delivery observation.
+ */
+export interface SessionQuerySource {
+  load?(sessionId: string, signal?: AbortSignal): Promise<unknown>
+}
+
+export interface SessionBridgeDeps {
+  controller: SessionController | null | undefined
+  agents?: { get?: (sessionId: string) => unknown }
+  /**
+   * The query service may be provided after this plugin mounts (it is mounted by a later
+   * composition row), so a function is accepted and resolved per call.
+   */
+  sessionQuery?: SessionQuerySource | (() => SessionQuerySource | undefined)
+  /**
+   * The live Session service. A freshly created Session is live before any cold-read service is
+   * reachable, so this is the authoritative fallback for member creation and live observation.
+   */
+  liveSession?: (sessionId: string) => unknown
+}
+export function createSessionBridge({ controller, agents, sessionQuery, liveSession }: SessionBridgeDeps): SessionBridge {
   if (controller === null || typeof controller !== 'object') throw new LiveTeamsError('CAPABILITY_UNAVAILABLE', 'sessionController is not available in this composition')
   const liveAgentOf = (sessionId: string): unknown => agents?.get?.(sessionId)
+  const queryService = (): SessionQuerySource | undefined => typeof sessionQuery === 'function' ? sessionQuery() : sessionQuery
+  /**
+   * Read one Session through whichever inspection API the host still offers.
+   * Inspection is deliberately not cached: delivery receipts depend on current history.
+   */
+  const snapshotOf = async (sessionId: string): Promise<RecordValue> => {
+    if (typeof controller.inspect === 'function') return record(await controller.inspect(sessionId))
+    // A live Session is readable without any cold-read service. This is the path that makes a
+    // freshly created member Session usable even before sessionQuery is injected or started.
+    try {
+      const live = record(liveSession?.(sessionId))
+      const header = record(live.header)
+      if (header.id === sessionId) {
+        const events = typeof live.snapshotEvents === 'function' ? (live.snapshotEvents as () => unknown)() : []
+        return { meta: header, inheritedEventCount: live.inheritedEventCount, events: Array.isArray(events) ? events : [] }
+      }
+    } catch { /* fall through to the cold-read service */ }
+    const query = queryService()
+    if (typeof query?.load === 'function') {
+      const loaded = record(await query.load(sessionId))
+      const meta = record(loaded.header ?? loaded.meta)
+      return {
+        meta,
+        ...(loaded.inheritedEventCount === undefined ? {} : { inheritedEventCount: loaded.inheritedEventCount }),
+        events: Array.isArray(loaded.events) ? loaded.events : [],
+      }
+    }
+    // Last resort for a cold descriptor: the visible Session list carries identity and cwd even
+    // when the history service is not reachable. It cannot prove request history, so events stay
+    // empty; binding can still resolve and delivery observation degrades honestly.
+    if (typeof controller.list === 'function') {
+      const page = record(await controller.list({}))
+      const items = Array.isArray(page.items) ? page.items : Array.isArray(page) ? page : []
+      const found = items.map(record).find((item) => text(item.sessionId) === sessionId || text(item.id) === sessionId)
+      if (found !== undefined) return { meta: { ...found, id: sessionId }, events: [] }
+    }
+    throw new LiveTeamsError('CAPABILITY_UNAVAILABLE', 'Session inspection is unavailable: this host offers neither sessionController.inspect, a live Session, sessionQuery.load nor a readable Session list', { auditDetail: 'host compatibility: no Session inspection API' })
+  }
   const bridge: SessionBridge = {
+    async removeQueuedRequest(sessionId, requestId) {
+      if (text(sessionId) === undefined || text(requestId) === undefined) return { state: 'refused', reason: 'invalid-request-identity' }
+      const agent = record(liveAgentOf(sessionId))
+      const header = record(record(agent.session).header)
+      if (header.id !== sessionId || controller.updateQueue === undefined) return { state: 'unobservable', reason: 'pending-queue-unavailable' }
+      if (isSubagentHeader(header)) return { state: 'refused', reason: 'subagent-owned' }
+      const inbox = record(agent.inbox)
+      if (!Array.isArray(inbox.nextTurn) || !Array.isArray(inbox.nextStep)) return { state: 'unobservable', reason: 'pending-queue-unavailable' }
+      const matches = [...inbox.nextTurn, ...inbox.nextStep].map(record).filter(message => record(message.source).kind === 'user' && record(message.source).rpcId === requestId)
+      if (matches.length === 0) return { state: 'not-pending' }
+      const itemId = text(matches[0]?.id)
+      if (matches.length !== 1 || itemId === undefined) return { state: 'refused', reason: 'pending-identity-ambiguous' }
+      try {
+        await controller.updateQueue({ sessionId, itemId, action: { kind: 'remove' } })
+        return { state: 'removed', itemId }
+      } catch (error) {
+        return record(error).code === 'session/queue-item-not-found' ? { state: 'not-pending', itemId } : { state: 'refused', itemId, reason: 'native-queue-removal-refused' }
+      }
+    },
     async create(request) {
       const sessionId = text(request?.sessionId)
       if (sessionId === undefined) throw new LiveTeamsError('CAPABILITY_UNAVAILABLE', 'create requires an explicit plugin-owned sessionId')
@@ -116,7 +215,7 @@ export function createSessionBridge({ controller, agents }: SessionBridgeDeps): 
       return descriptor
     },
     async inspect(sessionId) {
-      try { return descriptorOf(record(await controller.inspect(sessionId)), liveAgentOf(sessionId)) } catch (error) {
+      try { return descriptorOf(await snapshotOf(sessionId), liveAgentOf(sessionId)) } catch (error) {
         if (isMissingSession(error)) return undefined
         throw toBridgeError(error)
       }
@@ -134,6 +233,45 @@ export function createSessionBridge({ controller, agents }: SessionBridgeDeps): 
     },
     selectModel() {
       throw new LiveTeamsError('CAPABILITY_UNAVAILABLE', 'Model selection is intentionally unavailable in this build', { auditDetail: 'Phase 2 policy omits member model selection because selectModel also rewrites the deployment-wide default model. This must not be worked around silently.' })
+    },
+    async observeHumanActivity(sessionId, since, knownRequestIds) {
+      let inspection: RecordValue
+      try { inspection = await snapshotOf(sessionId) } catch { return undefined }
+      if (record(inspection.meta ?? inspection.header).id !== sessionId || !Array.isArray(inspection.events)) return undefined
+      const known = new Set(knownRequestIds)
+      for (const raw of inspection.events) {
+        const event = record(raw)
+        if (event.type !== 'user/message') continue
+        if (typeof event.time !== 'number' || !Number.isFinite(event.time)) return undefined
+        if (event.time <= since) continue
+        const source = record(record(event.data).source)
+        if (source.kind !== 'user' && source.kind !== undefined) continue
+        if (typeof source.rpcId !== 'string' || !known.has(source.rpcId)) return true
+      }
+      return false
+    },
+    async observeRequest(sessionId, requestId) {
+      if (text(sessionId) === undefined || text(requestId) === undefined) return { state: 'unobservable', reason: 'invalid-request-identity' }
+      let inspection: RecordValue
+      try { inspection = await snapshotOf(sessionId) } catch (error) {
+        return isMissingSession(error) ? { state: 'failed', reason: 'session-missing' } : { state: 'unobservable', reason: 'inspection-failed' }
+      }
+      const meta = record(inspection.meta ?? inspection.header)
+      if (meta.id !== sessionId) return { state: 'unobservable', reason: 'session-identity-unconfirmed' }
+      if (!Array.isArray(inspection.events)) return { state: 'unobservable', reason: 'event-inspection-unavailable' }
+      const events = inspection.events.map(record).filter(event => Number.isInteger(event.seq)).sort((a, b) => Number(a.seq) - Number(b.seq))
+      const input = events.find(event => event.type === 'user/message' && record(record(event.data).source).rpcId === requestId)
+      if (input === undefined) return { state: 'pending' }
+      const inputSeq = Number(input.seq)
+      const start = events.filter(event => event.type === 'turn/start' && Number(event.seq) < inputSeq).at(-1)
+      const turn = record(start?.data).turn
+      if (typeof turn !== 'number' || !Number.isInteger(turn)) return { state: 'unobservable', inputSeq, reason: 'turn-identity-unconfirmed' }
+      const end = events.find(event => event.type === 'turn/end' && Number(event.seq) > inputSeq && record(event.data).turn === turn)
+      if (end === undefined) return { state: 'started', turn, inputSeq }
+      const kind = text(record(record(end.data).reason).kind)
+      // Do not retain source objects or error/message bodies in a team receipt.
+      if (kind === 'completed') return { state: 'completed', turn, inputSeq }
+      return { state: 'failed', turn, inputSeq, reason: kind ?? 'turn-ended-without-completion' }
     },
     async deliver(sessionId, envelope) {
       if (envelope.mode !== 'queue' && envelope.mode !== 'steer') throw new LiveTeamsError('DELIVERY_REJECTED', `Unsupported delivery mode "${String(envelope.mode)}"`)

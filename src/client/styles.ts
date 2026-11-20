@@ -387,7 +387,7 @@ export const css = `
   background: var(--dsw-alias-bg-layer-2);
 }
 
-.dshLiveTeamsInboxRow p { margin: 4px 0 0; }
+.dshLiveTeamsInboxRow p { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .dshLiveTeamsInboxKind,
 .dshLiveTeamsInboxAcknowledged { display: block; color: var(--dsw-alias-label-secondary); font-size: 11px; }
 
@@ -1594,6 +1594,214 @@ export const css = `
   color: var(--dsw-alias-label-primary);
 }
 
+.dshLiveTeamsPanelError {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--dsw-alias-border-primary);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 17px;
+}
+
+.dshLiveTeamsPanelError p {
+  margin: 0;
+}
+
+.dshLiveTeamsPanelErrorHint {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dshLiveTeamsPanelErrorStack {
+  margin: 0;
+  max-height: 120px;
+  overflow: auto;
+  font-size: 11px;
+  white-space: pre-wrap;
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* Task-first Team: visual hierarchy matched to the approved mockup; no host theme overrides. */
+.dshLiveTeamsTaskFirst { --dsh-team-accent: var(--dsw-alias-state-business-primary, rgb(237 135 83)); padding: 14px 18px 28px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsShell { display: flex; flex-direction: column; gap: 12px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsHead { min-width: 0; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMain { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMain > .dshLiveTeamsCard { width: 100%; margin: 0; padding: 14px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsCard { border-color: color-mix(in srgb, var(--dsw-alias-border-l2) 78%, transparent); border-radius: 9px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsSummary { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px 24px; margin: 0; padding: 12px 16px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsSummary > .dshLiveTeamsSectionHeader { flex: 0 1 auto; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsSummary h2 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 17px; font-weight: 600; line-height: 24px; overflow-wrap: anywhere; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsSummary h2::before { content: ''; width: 9px; height: 9px; flex: none; border-radius: 50%; background: var(--dsw-alias-state-success-primary, rgb(69 189 123)); }
+.dshLiveTeamsTaskFirst .dshLiveTeamsSummaryGrid { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsStat { display: flex; flex-direction: row-reverse; align-items: baseline; gap: 4px; padding: 0; min-height: 0; border: 0; background: transparent; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsStat[hidden] { display: none; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsStatLabel { font-size: 11px; font-weight: 400; line-height: 18px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsStatValue { margin: 0; font-size: 11px; line-height: 18px; font-weight: 500; color: var(--dsw-alias-label-secondary); }
+.dshLiveTeamsOverviewActions { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+.dshLiveTeamsSettingsToggle { display: inline-flex; align-items: center; gap: 7px; padding: 6px 11px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; background: color-mix(in srgb, var(--dsw-alias-label-primary) 3%, transparent); color: var(--dsw-alias-label-primary); font: inherit; font-size: 11px; cursor: pointer; }
+.dshLiveTeamsSettingsToggle svg { width: 14px; height: 14px; }
+.dshLiveTeamsSettingsToggle:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.dshLiveTeamsTaskFirst .dshLiveTeamsCardTitle { align-items: center; gap: 18px; margin-bottom: 12px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsCardTitleText { font-size: 14px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskControls { display: contents; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskFilter { order: 1; gap: 12px; margin: 0 auto 0 0; border: 0; padding: 0; background: none; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskFilterButton { border-radius: 0; padding: 7px 3px; border-bottom: 2px solid transparent; background: none; font-size: 11px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskFilterButtonActive { color: var(--dsw-alias-label-primary); background: none; border-bottom-color: var(--dsh-team-accent); }
+.dshLiveTeamsTaskFirst .dshLiveTeamsDispatchToggle { order: 2; font-size: 10px; opacity: .8; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskNew { display: inline-flex; align-items: center; justify-content: center; gap: 5px; order: 3; padding: 7px 11px; border: 1px solid color-mix(in srgb, var(--dsh-team-accent) 75%, white); border-radius: 6px; background: var(--dsh-team-accent); color: rgb(30 21 16); font-size: 11px; font-weight: 600; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskNew:hover:not(:disabled) { background: rgb(244 155 112); color: rgb(30 21 16); }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskList { gap: 7px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskRow { background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 75%, var(--dsw-alias-bg-layer-2)); border-color: color-mix(in srgb, var(--dsw-alias-border-l2) 75%, transparent); }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskSummary { display: grid; grid-template-columns: 32px minmax(0, 1fr) minmax(90px, 130px) minmax(115px, 160px) 30px 86px; align-items: center; gap: 14px; padding: 14px 12px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskDisclosure { position: relative; width: 32px; height: 34px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 7px; background: rgb(255 255 255 / 4%); transform: none; }
+.dshLiveTeamsTaskChevron { position: absolute; right: -5px; bottom: -2px; display: flex; background: var(--dsw-alias-bg-layer-1); border-radius: 50%; }
+.dshLiveTeamsTaskDisclosureOpen .dshLiveTeamsTaskChevron { transform: rotate(180deg); }
+.dshLiveTeamsMemberCount { color: var(--dsw-alias-label-tertiary); font-size: 11px; font-weight: 400; }
+.dshLiveTeamsTaskIdentity { display: flex; flex-direction: column; min-width: 0; gap: 6px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskTitle { white-space: normal; overflow-wrap: anywhere; font-size: 13px; font-weight: 550; line-height: 19px; }
+.dshLiveTeamsTaskMetadata { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; min-width: 0; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskRoute { grid-column: auto; white-space: normal; overflow-wrap: anywhere; font-size: 11px; }
+.dshLiveTeamsTaskOwner, .dshLiveTeamsTaskStage, .dshLiveTeamsTaskFirst .dshLiveTeamsTaskAge { display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 6px; min-width: 0; font-size: 12px; text-align: left; }
+.dshLiveTeamsTaskOwner > span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.dshLiveTeamsTaskOwner small, .dshLiveTeamsTaskStage small, .dshLiveTeamsTaskAge small { color: var(--dsw-alias-label-tertiary); font-size: 10px; font-weight: 400; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskStatus { padding: 4px 7px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 5px; font-size: 10px; font-weight: 500; white-space: normal; }
+.dshLiveTeamsTaskStage[data-status='in_progress'] .dshLiveTeamsTaskStatus { background: rgb(49 133 85 / 18%); border-color: rgb(83 171 121 / 25%); color: var(--dsw-alias-state-success-primary, rgb(145 210 174)); }
+.dshLiveTeamsTaskStage[data-status='waiting'][data-route='review'] .dshLiveTeamsTaskStatus { background: rgb(113 80 168 / 22%); border-color: rgb(155 123 203 / 30%); color: rgb(199 178 236); }
+.dshLiveTeamsTaskStage[data-status='needs_human'] .dshLiveTeamsTaskStatus { color: var(--dsw-alias-state-warn-primary, rgb(223 186 130)); border-color: rgb(193 148 77 / 30%); }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskQueued { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsTaskRound { color: var(--dsw-alias-label-tertiary); font-size: 10px; }
+.dshLiveTeamsTaskEmpty { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 8px 12px; color: var(--dsw-alias-label-tertiary); border: 1px dashed color-mix(in srgb, var(--dsw-alias-border-l2) 75%, transparent); border-radius: 6px; }
+.dshLiveTeamsTaskEmpty p { margin: 0; font-size: 12px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMembers { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMembers > .dshLiveTeamsAddButton { margin: 0; grid-column: 2; font-size: 11px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMembers > .dshLiveTeamsMessage { grid-column: 1 / -1; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsRows { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(170px, 100%), 1fr)); gap: 8px; grid-column: 1 / -1; margin: 0; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsRows > .dshLiveTeamsRow { min-width: 0; max-width: none; padding: 0; border: 1px solid color-mix(in srgb, var(--dsw-alias-border-l2) 75%, transparent); border-radius: 7px; background: linear-gradient(145deg, rgb(255 255 255 / 2%), transparent), var(--dsw-alias-bg-layer-1); box-shadow: none; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsRowSelected { border-color: var(--dsh-team-accent); }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMemberCollapsed { display: grid; grid-template-columns: 32px minmax(0, 1fr) 10px; align-items: start; box-sizing: border-box; padding: 12px; gap: 6px 10px; border-radius: 7px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMemberCollapsed:hover { background: rgb(255 255 255 / 3%); }
+.dshLiveTeamsMemberAvatar { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 1px solid rgb(255 255 255 / 7%); border-radius: 50%; background: rgb(255 255 255 / 5%); color: var(--dsw-alias-label-secondary); }
+/* Hue identifies declared responsibility only; Session liveness stays in its own indicator. */
+.dshLiveTeamsMemberAvatar[data-agent-role='lead'] { --dsh-agent-hue: rgb(218 171 92); }
+.dshLiveTeamsMemberAvatar[data-agent-role='builder'] { --dsh-agent-hue: rgb(109 159 226); }
+.dshLiveTeamsMemberAvatar[data-agent-role='reviewer'] { --dsh-agent-hue: rgb(177 139 222); }
+.dshLiveTeamsMemberAvatar[data-agent-role='verifier'] { --dsh-agent-hue: rgb(89 181 163); }
+.dshLiveTeamsMemberAvatar[data-agent-role='oracle'] { --dsh-agent-hue: rgb(100 187 210); }
+.dshLiveTeamsMemberAvatar[data-agent-role='researcher'] { --dsh-agent-hue: rgb(148 151 220); }
+.dshLiveTeamsMemberAvatar[data-agent-role='scout'] { --dsh-agent-hue: rgb(217 151 112); }
+.dshLiveTeamsMemberAvatar[data-agent-role='delegate'] { --dsh-agent-hue: rgb(143 164 186); }
+.dshLiveTeamsMemberAvatar[data-agent-role]:not([data-agent-role='custom']) { color: color-mix(in srgb, var(--dsh-agent-hue) 78%, var(--dsw-alias-label-primary)); background: color-mix(in srgb, var(--dsh-agent-hue) 12%, var(--dsw-alias-bg-layer-1)); border-color: color-mix(in srgb, var(--dsh-agent-hue) 28%, transparent); }
+.dshLiveTeamsMemberCopy { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMemberName { min-width: 0; font-weight: 550; overflow: hidden; text-overflow: ellipsis; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMemberChip { align-self: flex-start; padding: 0; background: none; color: var(--dsw-alias-label-tertiary); font-weight: 400; font-size: 10px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMemberLive { font-size: 10px; font-weight: 400; white-space: nowrap; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMemberLiveOn { color: var(--dsw-alias-state-success-primary, rgb(113 195 149)); }
+.dshLiveTeamsMemberMenu { color: var(--dsw-alias-label-tertiary); font-size: 17px; line-height: 16px; }
+.dshLiveTeamsMemberPaused { grid-column: 2; color: rgb(216 179 124); font-size: 10px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMemberTask { grid-column: 1 / -1; margin: 5px 0 0; padding-top: 9px; border-top: 1px solid color-mix(in srgb, var(--dsw-alias-border-l2) 65%, transparent); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-secondary); font-size: 11px; line-height: 17px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsMemberNote { grid-column: 1 / -1; margin: 0; min-width: 0; font-size: 10px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalList { max-height: min(65vh, 800px); gap: 0; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalRow { padding: 9px 0; border-bottom: 1px solid color-mix(in srgb, var(--dsw-alias-border-l2) 65%, transparent); }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalRow:last-child { border-bottom: 0; }
+.dshLiveTeamsActivityModes { display: flex; align-items: center; gap: 5px; margin-left: auto; padding: 0; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsActivityModes .dshLiveTeamsSegmentedButton { min-width: 60px; padding: 5px 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 18px; font-size: 10px; background: none; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsActivityModes .dshLiveTeamsSegmentedButtonActive { color: var(--dsh-team-accent); border-color: var(--dsh-team-accent); background: rgb(237 135 83 / 5%); }
+.dshLiveTeamsActivityCategories { color: var(--dsw-alias-label-tertiary); font-size: 10px; }
+.dshLiveTeamsActivityCategories > summary { cursor: pointer; padding: 5px; }
+.dshLiveTeamsActivityCategories[open] { flex-basis: 100%; }
+.dshLiveTeamsActivityCategories .dshLiveTeamsJournalFilters { justify-content: flex-start; margin: 6px 0 0; width: fit-content; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalLine { position: relative; display: grid; width: 100%; grid-template-columns: 32px minmax(0, 1fr) auto 14px; gap: 3px 12px; align-items: center; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalIcon { grid-column: 1; grid-row: 1 / 3; display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 8px; color: rgb(208 176 126); background: rgb(164 126 66 / 14%); }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalIcon-task { color: rgb(136 197 162); background: rgb(59 140 93 / 17%); }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalIcon-message { color: rgb(148 182 219); background: rgb(62 121 174 / 17%); }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalIcon-review { color: rgb(189 167 223); background: rgb(123 82 176 / 17%); }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalKind { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); padding: 0; border: 0; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalSummary { grid-column: 2; grid-row: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; line-height: 19px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalRefs { grid-column: 2; grid-row: 2; display: flex; align-items: center; gap: 7px; min-width: 0; overflow: hidden; color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 17px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalTaskRef { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalRoundRef { flex: none; white-space: nowrap; font-size: 10px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalTaskId { display: none; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalTime { grid-column: 3; grid-row: 1 / 3; color: var(--dsw-alias-label-tertiary); font-size: 10px; }
+.dshLiveTeamsTaskFirst .dshLiveTeamsJournalDisclosure { grid-column: 4; grid-row: 1 / 3; }
+.dshLiveTeamsJournalSourceSummary { margin: 0; white-space: normal; overflow-wrap: anywhere; }
+.dshLiveTeamsDrawerBackdrop { position: fixed; inset: 0; z-index: 900; display: flex; justify-content: flex-end; background: rgb(0 0 0 / 38%); }
+.dshLiveTeamsDrawer { display: flex; flex-direction: column; box-sizing: border-box; width: min(520px, 100%); height: 100%; padding-top: var(--dsh-frame-overlay-top, 0px); min-width: 0; background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); border-left: 1px solid var(--dsw-alias-border-l2); box-shadow: -12px 0 40px rgb(0 0 0 / 18%); }
+.dshLiveTeamsDrawerHeader { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--dsw-alias-border-l2); }
+.dshLiveTeamsDrawerHeader h3 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.dshLiveTeamsDrawerHeader .dshLiveTeamsIconButton { font-size: 22px; }
+.dshLiveTeamsDrawerBody { padding: 16px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.dshLiveTeamsDrawerBody > .dshLiveTeamsTeamControls { margin: 0; padding: 0; border: 0; background: transparent; }
+.dshLiveTeamsDrawerBody .dshLiveTeamsHeader { flex-wrap: wrap; }
+.dshLiveTeamsDrawerBody .dshLiveTeamsLeadControl { flex-basis: 100%; margin-left: 0; }
+.dshLiveTeamsDrawerBody .dshLiveTeamsMemberPanel { margin: 0; padding: 14px; }
+.dshLiveTeamsDrawerBody .dshLiveTeamsMemberIdentity { flex-wrap: wrap; }
+.dshLiveTeamsDrawerBody .dshLiveTeamsMetaValue { overflow-wrap: anywhere; }
+.dshLiveTeamsSettingsToggle:focus-visible, .dshLiveTeamsMemberCollapsed:focus-visible, .dshLiveTeamsActivityCategories > summary:focus-visible { outline: 2px solid var(--dsh-team-accent); outline-offset: 2px; }
+@container dshLiveTeamsCard (max-width: 700px) {
+  .dshLiveTeamsTaskFirst .dshLiveTeamsTaskSummary { grid-template-columns: 32px minmax(0, 1fr) 86px; gap: 10px; }
+  .dshLiveTeamsTaskFirst .dshLiveTeamsTaskDisclosure { grid-column: 1; grid-row: 1 / 4; }
+  .dshLiveTeamsTaskFirst .dshLiveTeamsTaskIdentity { grid-column: 2; grid-row: 1; }
+  .dshLiveTeamsTaskFirst .dshLiveTeamsTaskOwner { grid-column: 2; grid-row: 2; }
+  .dshLiveTeamsTaskFirst .dshLiveTeamsTaskStage { grid-column: 2; grid-row: 3; }
+  .dshLiveTeamsTaskFirst .dshLiveTeamsTaskAge { grid-column: 3; grid-row: 1; }
+  .dshLiveTeamsTaskFirst .dshLiveTeamsTaskRound { grid-column: 3; grid-row: 2; }
+  .dshLiveTeamsTaskFirst .dshLiveTeamsTaskFilter { gap: 8px; }
+  .dshLiveTeamsTaskFirst .dshLiveTeamsDispatchToggle { flex-basis: 100%; text-align: left; }
+}
+@media (max-width: 600px) {
+  .dshLiveTeamsTaskFirst { padding: 8px; }
+  .dshLiveTeamsTaskFirst .dshLiveTeamsMain > .dshLiveTeamsCard { padding: 12px; }
+  .dshLiveTeamsTaskFirst .dshLiveTeamsSummaryGrid { flex-basis: 100%; order: 3; }
+  .dshLiveTeamsTaskFirst .dshLiveTeamsSummary { gap: 8px; }
+  .dshLiveTeamsTaskFirst .dshLiveTeamsActivityModes { margin-left: 0; flex-wrap: wrap; }
+}
+
+/* Member settings: clear sections rather than a nested role-colored roster card. */
+.dshLiveTeamsMemberFeedback { position: sticky; top: 0; z-index: 2; margin: 0 0 14px; padding: 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; background: var(--dsw-alias-bg-layer-2); font-size: 12px; }
+.dshLiveTeamsDrawerBody .dshLiveTeamsMemberPanel.dshLiveTeamsMemberSettings { display: flex; flex-direction: column; align-items: stretch; gap: 0; width: 100%; margin: 0; padding: 0; border: 0; border-radius: 0; background: none; box-shadow: none; }
+.dshLiveTeamsMemberSettings > .dshLiveTeamsMemberHeading { display: grid; grid-template-columns: 44px minmax(0, 1fr); align-items: center; gap: 12px; padding: 2px 0 20px; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberHeading > .dshLiveTeamsMemberAvatar { width: 44px; height: 44px; box-sizing: border-box; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberHeading > .dshLiveTeamsMemberAvatar svg { width: 25px; height: 25px; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberIdentity { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberAction { min-width: 0; max-width: 100%; padding: 0; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberName { font-size: 16px; font-weight: 600; line-height: 23px; white-space: normal; overflow-wrap: anywhere; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberRoleCaption { flex: 1 1 100%; order: 1; color: var(--dsw-alias-label-tertiary); font-size: 11px; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsState { flex: 1 1 100%; order: 2; font-size: 11px; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsNameInput { flex: 1 1 100%; width: 100%; min-width: 0; max-width: 100%; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsNameActions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsEditNameButton { flex: none; opacity: 1; }
+.dshLiveTeamsMemberSection { display: flex; flex-direction: column; align-items: stretch; gap: 9px; margin: 0; padding: 18px 0; border-top: 1px solid var(--dsw-alias-border-l2); }
+.dshLiveTeamsMemberSettings h4 { margin: 0; font-size: 12px; font-weight: 600; line-height: 18px; color: var(--dsw-alias-label-primary); }
+.dshLiveTeamsSectionHint { margin: 0; color: var(--dsw-alias-label-secondary); font-size: 11px; font-weight: 400; line-height: 17px; white-space: normal; overflow-wrap: anywhere; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsControls { display: flex; flex-wrap: nowrap; align-items: flex-end; gap: 8px; width: 100%; margin: 0; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsRoleField { display: flex; flex: 1 1 auto; flex-direction: column; gap: 5px; min-width: 0; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsRoleInput { box-sizing: border-box; max-width: 100%; min-width: 0; height: 34px; border-radius: 6px; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsApply { flex: none; min-height: 32px; }
+.dshLiveTeamsDraftHint { margin: 0; font-size: 10px; line-height: 16px; color: var(--dsw-alias-state-warn-primary); }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberActions { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; margin: 2px 0 0; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsAvailabilityAction { display: inline-flex; flex: none; align-items: center; justify-content: center; gap: 6px; width: auto; height: 32px; padding: 5px 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; font-size: 11px; color: var(--dsw-alias-label-primary); }
+.dshLiveTeamsMemberSettings .dshLiveTeamsContactGrant { display: flex; flex-direction: column; align-items: stretch; gap: 10px; flex-basis: auto; margin: 0; }
+.dshLiveTeamsContactChips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.dshLiveTeamsContactChip { display: inline-flex; align-items: center; max-width: 100%; padding: 4px 8px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font-size: 11px; line-height: 15px; overflow-wrap: anywhere; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsGrantControls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsContactSelect { flex: 1 1 100%; width: 100%; margin-bottom: 2px; }
+.dshLiveTeamsMemberSessionActions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.dshLiveTeamsBindingTag { color: var(--dsw-alias-label-secondary); font-size: 11px; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberOpen { display: inline-flex; justify-content: center; padding: 6px 11px; min-height: 30px; font-size: 11px; border-color: var(--dsw-alias-border-l2); color: var(--dsw-alias-label-primary); }
+.dshLiveTeamsMemberTurnControl { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; margin-top: 4px; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsInterruptButton { align-self: flex-start; padding: 6px 10px; font-size: 11px; }
+.dshLiveTeamsMemberNoteText { margin: 0; color: var(--dsw-alias-label-secondary); font-size: 12px; line-height: 18px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dshLiveTeamsMemberTechnical { padding: 14px 0; border-top: 1px solid var(--dsw-alias-border-l2); }
+.dshLiveTeamsMemberTechnical > summary { cursor: pointer; color: var(--dsw-alias-label-secondary); font-size: 11px; line-height: 20px; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberMeta { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin: 14px 0 0; padding: 0; border: 0; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberMeta > div { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberMeta dt { color: var(--dsw-alias-label-tertiary); font-size: 10px; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberMeta dd { margin: 0; font-size: 11px; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberMeta code { white-space: normal; overflow-wrap: anywhere; user-select: all; }
+.dshLiveTeamsMemberRemoval { display: flex; flex-direction: column; align-items: flex-start; gap: 9px; padding: 18px 0 2px; border-top: 1px solid var(--dsw-alias-border-l2); }
+.dshLiveTeamsMemberSettings .dshLiveTeamsMemberRemove { margin: 1px 0 0; padding: 6px 10px; font-size: 11px; }
+.dshLiveTeamsMemberTechnical > summary:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary); outline-offset: 2px; border-radius: 3px; }
 `
 
 export function installLiveTeamsStyles(): () => void {

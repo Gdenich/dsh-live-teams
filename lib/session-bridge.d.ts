@@ -23,7 +23,11 @@ export interface SessionDescriptor {
 }
 export interface SessionController {
   create(payload: Record<string, unknown>): Promise<unknown>;
-  inspect(sessionId: string): Promise<unknown>;
+  /**
+   * Removed in DSH 0.2.2-rc.1. Kept optional so this bridge still works on older hosts; new
+   * hosts are served through `SessionQuerySource.load`.
+   */
+  inspect?(sessionId: string): Promise<unknown>;
   list?(request: Record<string, unknown>, signal?: AbortSignal): Promise<unknown>;
   rename(payload: {
     sessionId: string;
@@ -38,8 +42,27 @@ export interface SessionController {
   cancel(payload: {
     sessionId: string;
   }): void;
+  updateQueue?(payload: {
+    sessionId: string;
+    itemId: string;
+    action: {
+      kind: 'remove';
+    };
+  }): Promise<unknown>;
 }
+export type SessionExecutionReceipt = {
+  state: 'pending' | 'started' | 'completed' | 'failed' | 'unobservable';
+  turn?: number;
+  inputSeq?: number;
+  reason?: string;
+};
+export type QueueRemovalReceipt = {
+  state: 'removed' | 'not-pending' | 'unobservable' | 'refused';
+  itemId?: string;
+  reason?: string;
+};
 export interface SessionBridge {
+  removeQueuedRequest(sessionId: string, requestId: string): Promise<QueueRemovalReceipt>;
   create(request: {
     sessionId?: string;
     workspaceId?: string;
@@ -47,6 +70,9 @@ export interface SessionBridge {
     agentPreset?: string;
   }): Promise<SessionDescriptor>;
   inspect(sessionId: string): Promise<SessionDescriptor | undefined>;
+  /** Observe an exact prompt's turn using metadata only, not generic agent liveness. */
+  observeRequest(sessionId: string, requestId: string): Promise<SessionExecutionReceipt>;
+  observeHumanActivity(sessionId: string, since: number, knownRequestIds: readonly string[]): Promise<boolean | undefined>;
   validateAttachment(sessionId: string, workspaceId: string): Promise<SessionDescriptor>;
   rename(sessionId: string, title: string): Promise<{
     title: string;
@@ -66,11 +92,31 @@ export interface SessionBridge {
   reconcile(sessionIds: readonly string[]): Promise<SessionDescriptor[]>;
 }
 export declare function toBridgeError(error: unknown): LiveTeamsError;
+/**
+ * The host's cold-safe Session reader.
+ *
+ * DSH 0.2.2-rc.1 moved inspection off `sessionController` onto `ctx.sessionQuery.load`, which
+ * returns `{ header, inheritedEventCount, events }`. The bridge normalizes both shapes, so a
+ * deployment may upgrade without losing member validation or delivery observation.
+ */
+export interface SessionQuerySource {
+  load?(sessionId: string, signal?: AbortSignal): Promise<unknown>;
+}
 export interface SessionBridgeDeps {
   controller: SessionController | null | undefined;
   agents?: {
     get?: (sessionId: string) => unknown;
   };
+  /**
+   * The query service may be provided after this plugin mounts (it is mounted by a later
+   * composition row), so a function is accepted and resolved per call.
+   */
+  sessionQuery?: SessionQuerySource | (() => SessionQuerySource | undefined);
+  /**
+   * The live Session service. A freshly created Session is live before any cold-read service is
+   * reachable, so this is the authoritative fallback for member creation and live observation.
+   */
+  liveSession?: (sessionId: string) => unknown;
 }
-export declare function createSessionBridge({ controller, agents }: SessionBridgeDeps): SessionBridge;
+export declare function createSessionBridge({ controller, agents, sessionQuery, liveSession }: SessionBridgeDeps): SessionBridge;
 //#endregion

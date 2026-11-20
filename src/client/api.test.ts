@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { addTeamMember, canOpenWorkspaceRoles, fetchTeamJournal, fetchTeamRoles, fetchTeamSnapshot, interruptTeamMember, removeTeamMember } from './api.js'
+import { revokeTeamTask, updateTeamTask, cancelTeamTask, resumeTeamTask, acceptTeamTask, reviseTeamTask, addTeamMember, canOpenWorkspaceRoles, fetchTeamTasks, fetchTeamTask, fetchTeamJournal, fetchTeamRoles, fetchTeamSnapshot, interruptTeamMember, removeTeamMember } from './api.js'
 
 function body(extra: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -18,6 +18,71 @@ afterEach(() => { vi.unstubAllGlobals() })
 function respondWith(payload: string): void {
   vi.stubGlobal('fetch', async () => new Response(payload, { status: 200, headers: { 'content-type': 'application/json' } }))
 }
+
+describe('non-JSON HTTP diagnostics', () => {
+  it.each([200, 400, 503])('preserves HTTP %i when a task response has no JSON body', async (status) => {
+    vi.stubGlobal('fetch', async () => new Response('', { status, headers: { 'content-type': 'text/plain' } }))
+    await expect(fetchTeamTasks()).rejects.toMatchObject({ status, error: `invalid team response (HTTP ${status}; non-JSON body)` })
+  })
+})
+
+describe('review return response parsing', () => {
+  const reviewReturn = { roundId: 'r1', submissionId: 'sub1', attemptId: 'a1', generation: 1, assignee: 'worker', sessionId: 's-worker', bindingGeneration: 1, state: 'unconfirmed', at: 1, messageId: 'm1', requestId: 'req1', reason: 'execution-not-yet-observed', leadNotified: true }
+  it('retains launch uncertainty in list and detail responses', async () => {
+    const task = { id: 'task-1', teamId: 'team-1', title: 'Work', kind: 'work', status: 'in_progress', acceptance: ['Done'], roundLimit: 5, createdBy: 'lead', createdAt: 1, updatedAt: 2, revision: 3, reviewReturn }
+    respondWith(JSON.stringify({ teamId: 'team-1', tasks: [task] }))
+    expect((await fetchTeamTasks()).tasks[0]).toMatchObject({ reviewReturn })
+    respondWith(JSON.stringify({ task, document: 'Work', submissions: [], rounds: [], attempts: [] }))
+    expect((await fetchTeamTask('task-1')).task).toMatchObject({ reviewReturn })
+  })
+  it('rejects a claimed launch without turn evidence rather than hiding it', async () => {
+    respondWith(JSON.stringify({ teamId: 'team-1', tasks: [{ id: 'task-1', title: 'Work', status: 'in_progress', updatedAt: 1, reviewReturn: { ...reviewReturn, state: 'started' } }] }))
+    await expect(fetchTeamTasks()).rejects.toThrow()
+  })
+})
+
+describe('task lifecycle response parsing', () => {
+  const task = { id: 'task-1', teamId: 'team-1', title: 'Work', kind: 'work', status: 'cancelled', acceptance: ['Done'], roundLimit: 5, createdBy: 'lead', createdAt: 1, updatedAt: 2, revision: 3 }
+
+  it('reads a completed cancellation as a task, not as a member mutation', async () => {
+    respondWith(JSON.stringify({ task, archivedPath: 'archive/task-1.md', quiesced: true }))
+    await expect(cancelTeamTask('task-1', 'obsolete', 's-1')).resolves.toMatchObject({ task: { status: 'cancelled' }, archivedPath: 'archive/task-1.md', quiesced: true })
+  })
+
+  it('reads an unconfirmed stop without requiring an archive or claiming success', async () => {
+    respondWith(JSON.stringify({ task: { ...task, status: 'needs_human' }, quiesced: false }))
+    const result = await cancelTeamTask('task-1', 'obsolete', 's-1')
+    expect(result.quiesced).toBe(false)
+    expect(result.archivedPath).toBeUndefined()
+  })
+
+  it('rejects contradictory cancellation results', async () => {
+    respondWith(JSON.stringify({ task, quiesced: false, archivedPath: 'archive/task-1.md' }))
+    await expect(cancelTeamTask('task-1', 'obsolete', 's-1')).rejects.toThrow('invalid team response')
+  })
+
+  it('scopes explicit restart and reads the ready task', async () => {
+    const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({ task: { ...task, status: 'ready' } }), { status: 200 }))
+    vi.stubGlobal('fetch', fetch)
+    await expect(resumeTeamTask('task-1', 's-1')).resolves.toMatchObject({ task: { status: 'ready' } })
+    expect(fetch.mock.calls[0]?.[0]).toBe('/api/live-teams/task/resume')
+    expect(JSON.parse(String((fetch.mock.calls[0]?.[1] as RequestInit)?.body))).toMatchObject({ taskId: 'task-1', sessionId: 's-1' })
+  })
+
+  it('reads revocation and contract updates with task readers, not member readers', async () => {
+    respondWith(JSON.stringify({ task: { ...task, status: 'draft' }, attempt: { id: 'attempt-1', memberId: 'worker', sessionId: 's-1', generation: 1, startedAt: 1, status: 'revoked' }, quiesced: true, reassigned: false }))
+    await expect(revokeTeamTask({ taskId: 'task-1', reason: 'park' }, 's-1')).resolves.toMatchObject({ task: { status: 'draft' }, quiesced: true })
+    respondWith(JSON.stringify({ task: { ...task, status: 'ready' }, document: '# Updated', changed: ['title'] }))
+    await expect(updateTeamTask({ taskId: 'task-1', title: 'Updated' }, 's-1')).resolves.toMatchObject({ document: '# Updated', changed: ['title'] })
+  })
+
+  it('keeps acceptance and revision response contracts separate', async () => {
+    respondWith(JSON.stringify({ task: { ...task, status: 'completed' }, archivedPath: 'archive/task-1.md' }))
+    await expect(acceptTeamTask('task-1', undefined, 's-1')).resolves.toMatchObject({ archivedPath: 'archive/task-1.md' })
+    respondWith(JSON.stringify({ task: { ...task, status: 'in_progress' } }))
+    await expect(reviseTeamTask('task-1', 'fix', 's-1')).resolves.toMatchObject({ task: { status: 'in_progress' } })
+  })
+})
 
 describe('team journal parsing', () => {
   it('parses journal entries and scopes the query', async () => {

@@ -1,9 +1,9 @@
 import { MailboxService } from "./mailbox.js";
 import { MemberRecord, TeamStore } from "./team-store.js";
 import { TaskStore } from "./task-store.js";
-import { ReconcileResult } from "./dispatch.js";
-import { SessionBridge, createSessionBridge } from "./session-bridge.js";
+import { SessionBridge, SessionQuerySource, createSessionBridge } from "./session-bridge.js";
 import { SessionCommandQueue } from "./command-queue.js";
+import { ReconcileResult } from "./dispatch.js";
 import { MembershipContextProvider } from "./context-provider.js";
 import { LiveTeamsDispatch, LiveTeamsWebServer } from "./routes.js";
 import { ToolRuntime } from "@deepseek-ai/dsh-tools";
@@ -37,6 +37,11 @@ type HostContext = {
   get?: (name: string) => unknown;
   sessionController: Parameters<typeof createSessionBridge>[0]['controller'] & NativePathController;
   agents?: AgentRegistry;
+  sessions?: {
+    get?: (sessionId: string) => unknown;
+  };
+  /** Provided by the host through `ctx.inject`; not visible through a bare `ctx.get` here. */
+  sessionQuery?: SessionQuerySource;
   systemPrompt: {
     context: (definition: ReturnType<MembershipContextProvider['definition']>) => unknown;
   };

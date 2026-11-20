@@ -3,9 +3,16 @@ import type { MessageKind, TaskStatus, TeamAttemptStatus, TeamSubmissionScope } 
 import type { LocaleKey } from './locales.js';
 import './styles.js';
 export type TeamViewContext = {
-    readonly sessions: {
-        open(sessionId: string): void;
+    /** Kept for the roster and the attention chip; opening a session no longer goes through it. */
+    readonly sessions?: {
+        open?(sessionId: string): void;
     };
+    /**
+     * Opens a member's session, returning whether this host offers a way to do it at all. The host
+     * changed how sessions are opened between 0.1.5 and 0.1.7, so the panel asks for the behaviour
+     * rather than for a service by name.
+     */
+    readonly openSession?: (sessionId: string) => boolean;
     readonly t: (key: LocaleKey) => string;
 };
 export type TeamViewProps = {

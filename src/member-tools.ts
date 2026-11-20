@@ -25,6 +25,8 @@ export const MEMBER_TOOL_NAMES = Object.freeze([
   'live_team_accept_task',
   'live_team_revise_task',
   'live_team_revoke_task',
+  'live_team_cancel_task',
+  'live_team_resume_task',
 ] as const)
 
 export type MemberToolName = (typeof MEMBER_TOOL_NAMES)[number]
@@ -48,7 +50,7 @@ const MEMBER_BASE_TOOLS: readonly MemberToolName[] = [
 
 const LEAD_TOOLS: readonly MemberToolName[] = [
   'live_team_create_task', 'live_team_update_task', 'live_team_revoke_task', 'live_team_accept_task',
-  'live_team_revise_task', 'live_team_grant', 'live_team_dispatch', 'live_team_member_note',
+  'live_team_revise_task', 'live_team_cancel_task', 'live_team_resume_task', 'live_team_grant', 'live_team_dispatch', 'live_team_member_note',
 ]
 
 const REVIEW_TOOLS: readonly MemberToolName[] = ['live_team_review']
@@ -157,9 +159,9 @@ type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string
 type JsonRecord = Record<string, JsonValue>
 type ListedTaskValue = { documentMissing?: boolean } & JsonRecord
 function jsonRecord(value: unknown): JsonRecord { return JSON.parse(JSON.stringify(value)) as JsonRecord }
-function jsonCreateResult(value: unknown): { task: JsonRecord; documentPath: string } {
+function jsonCreateResult(value: unknown): { task: JsonRecord; documentPath: string; warnings?: JsonValue[] } {
   const candidate = jsonRecord(value)
-  return { task: jsonRecord(candidate.task), documentPath: String(candidate.documentPath) }
+  return { task: jsonRecord(candidate.task), documentPath: String(candidate.documentPath), ...(Array.isArray(candidate.warnings) ? { warnings: candidate.warnings } : {}) }
 }
 function jsonReadResult(value: unknown): { task: JsonRecord; document: string; submissions: JsonValue[]; rounds: JsonValue[] } {
   const candidate = jsonRecord(value)
@@ -301,7 +303,7 @@ export function registerMemberTools(registry: ToolRegistry, resolve: MemberTools
         title: { type: 'string', required: true },
         kind: { type: 'string', required: true, enum: ['work', 'research', 'requirements', 'implementation', 'verification', 'review', 'repair', 'integration'] },
         assignee: { type: 'string' },
-        route: { type: 'json', description: 'Where the finished work goes: {"type":"review","reviewer":"<member id>"} or {"type":"report","to":"human"}.' },
+        route: { type: 'json', description: 'Who receives the finished work: {"type":"review","reviewer":"<Reviewer member id>"} or {"type":"report","to":"<Lead/member id>"}; use {"type":"report","to":"human"} only when the report is intended for the human. For small Builder → Lead work, name the Lead member id. Report recipient does not change Lead/human acceptance authority.' },
         humanContact: { type: 'string', enum: ['none', 'expected', 'required'] },
         acceptance: { type: 'array', required: true, items: { type: 'string' }, description: 'What "done" means, each criterion checkable inside this task declared paths (e.g. "node --test packages/alpha/test"). A repository-wide criterion needs a declared dependency: a sibling task in flight makes it unsatisfiable.' },
         checks: { type: 'array', items: { type: 'string' } },
@@ -311,7 +313,7 @@ export function registerMemberTools(registry: ToolRegistry, resolve: MemberTools
         dependsOn: { type: 'array', items: { type: 'string' } },
         paths: { type: 'array', items: { type: 'string' }, description: 'Workspace-relative globs this task may touch. Two writing tasks with intersecting paths never run at the same time, so declare them for any task that writes code.' },
       },
-      output: { schema: { type: 'object', additionalProperties: false, properties: { task: { type: 'json', required: true }, documentPath: { type: 'string', required: true } } }, render: (_args, value) => renderOutput(value) },
+      output: { schema: { type: 'object', additionalProperties: false, properties: { task: { type: 'json', required: true }, documentPath: { type: 'string', required: true }, warnings: { type: 'array', items: { type: 'json' } } } }, render: (_args, value) => renderOutput(value) },
       execute: async (args: { title: string; kind: TaskKind; assignee?: string; route?: TaskRoute; humanContact?: HumanContact; acceptance: string[]; checks?: string[]; why?: string; body?: string; roundLimit?: number; dependsOn?: string[]; paths?: string[] }, exec) => {
         const binding = await resolve(sessionIdOf(exec))
         if (binding === undefined) throw new Error('calling Session is not an active member of this team')
@@ -330,7 +332,7 @@ export function registerMemberTools(registry: ToolRegistry, resolve: MemberTools
         title: { type: 'string' },
         kind: { type: 'string', enum: ['work', 'research', 'requirements', 'implementation', 'verification', 'review', 'repair', 'integration'] },
         assignee: { type: 'string' },
-        route: { type: 'json', description: 'Where the finished work goes: {"type":"review","reviewer":"<member id>"} or {"type":"report","to":"human"}.' },
+        route: { type: 'json', description: 'Who receives the finished work: {"type":"review","reviewer":"<Reviewer member id>"} or {"type":"report","to":"<Lead/member id>"}; use {"type":"report","to":"human"} only when the report is intended for the human. For small Builder → Lead work, name the Lead member id. Report recipient does not change Lead/human acceptance authority.' },
         humanContact: { type: 'string', enum: ['none', 'expected', 'required'] },
         acceptance: { type: 'array', items: { type: 'string' }, description: 'What "done" means, each criterion checkable inside this task declared paths (e.g. "node --test packages/alpha/test"). A repository-wide criterion needs a declared dependency: a sibling task in flight makes it unsatisfiable.' },
         checks: { type: 'array', items: { type: 'string' } },
@@ -340,7 +342,7 @@ export function registerMemberTools(registry: ToolRegistry, resolve: MemberTools
         dependsOn: { type: 'array', items: { type: 'string' } },
         paths: { type: 'array', items: { type: 'string' }, description: 'Workspace-relative globs this task may touch; null clears the declaration.' },
       },
-      output: { schema: { type: 'object', additionalProperties: false, properties: { task: { type: 'json', required: true }, document: { type: 'string', required: true }, changed: { type: 'array', required: true, items: { type: 'string' } } } }, render: (_args, value) => renderOutput(value) },
+      output: { schema: { type: 'object', additionalProperties: false, properties: { task: { type: 'json', required: true }, document: { type: 'string', required: true }, changed: { type: 'array', required: true, items: { type: 'string' } }, warnings: { type: 'array', items: { type: 'json' } } } }, render: (_args, value) => renderOutput(value) },
       // The wire schema types `route` as arbitrary JSON, so the patch is cast once
       // here; the store validates every field it is given.
       execute: async (args, exec) => {
@@ -350,12 +352,41 @@ export function registerMemberTools(registry: ToolRegistry, resolve: MemberTools
         // Authority is the store's: it is the only place that reads the team, and a
         // second check here is how two answers to one question appear.
         const result = await binding.taskStore.updateTask({ ...(args as unknown as UpdateTaskRequest), actor: binding.member.memberId })
-        return { task: jsonRecord(result.task), document: result.document, changed: [...result.changed] }
+        return { task: jsonRecord(result.task), document: result.document, changed: [...result.changed], ...(result.warnings === undefined ? {} : { warnings: result.warnings.map(jsonRecord) }) }
+      },
+    }))
+    registry.register(defineTool({
+      name: 'live_team_cancel_task',
+      description: 'Cancel and archive a task without accepting its work. Only the lead may cancel. A running attempt is invalidated and its Session must be observed stopped first. If that cannot be established, returns quiesced:false and needs_human without archiving; retry after resolving the runtime stop. Historical submissions remain evidence. Inspect notifications for the author notice; saved cancellation is not delivery and must not be repeated to retry a handoff.',
+      parameters: {
+        taskId: { type: 'string', required: true },
+        reason: { type: 'string', required: true },
+        expectedRevision: { type: 'integer' },
+      },
+      output: { schema: { type: 'object', additionalProperties: false, properties: { task: { type: 'json', required: true }, archivedPath: { type: 'string' }, quiesced: { type: 'boolean', required: true }, notifications: { type: 'array', items: { type: 'json' }, required: true } } }, render: (_args, value) => renderOutput(value) },
+      execute: async (args: { taskId: string; reason: string; expectedRevision?: number }, exec) => {
+        const binding = await resolve(sessionIdOf(exec))
+        if (binding === undefined) throw new Error('calling Session is not an active member of this team')
+        if (binding.taskStore === undefined) throw new Error('task store is unavailable')
+        const result = await binding.taskStore.cancelTask({ ...args, actor: binding.member.memberId })
+        return { task: jsonRecord(result.task), quiesced: result.quiesced, notifications: (result.notifications ?? []).map(jsonRecord), ...(result.archivedPath === undefined ? {} : { archivedPath: result.archivedPath }) }
+      },
+    }))
+    registry.register(defineTool({
+      name: 'live_team_resume_task',
+      description: 'Explicitly release a parked draft task back to the ready queue. Only the lead may resume. Revocation itself never automatically restarts work. The existing contract must have an assignee, route and acceptance criteria; no live/revoking attempt may remain.',
+      parameters: { taskId: { type: 'string', required: true }, expectedRevision: { type: 'integer' } },
+      output: { schema: { type: 'object', additionalProperties: false, properties: { task: { type: 'json', required: true } } }, render: (_args, value) => renderOutput(value) },
+      execute: async (args: { taskId: string; expectedRevision?: number }, exec) => {
+        const binding = await resolve(sessionIdOf(exec))
+        if (binding === undefined) throw new Error('calling Session is not an active member of this team')
+        if (binding.taskStore === undefined) throw new Error('task store is unavailable')
+        return { task: jsonRecord((await binding.taskStore.resumeTask({ ...args, actor: binding.member.memberId })).task) }
       },
     }))
     registry.register(defineTool({
       name: 'live_team_revoke_task',
-      description: 'Take a task away from the member working on it: invalidate their attempt, stop their Session, and return the task to ready (optionally for a new assignee). Only the lead may revoke. If the Session cannot be observed to have stopped, the task goes to needs_human instead of pretending it was revoked.',
+      description: 'Take a task away from the member working on it: invalidate their attempt, stop their Session, and park the task in draft (optionally for a new assignee). Only the lead may revoke. It will not be automatically reclaimed: use live_team_resume_task explicitly to restart. If the Session cannot be observed to have stopped, the task goes to needs_human instead of pretending it was revoked.',
       parameters: {
         taskId: { type: 'string', required: true },
         reason: { type: 'string', required: true },
@@ -427,7 +458,7 @@ export function registerMemberTools(registry: ToolRegistry, resolve: MemberTools
   if (includeReview) {
     registry.register(defineTool({
       name: 'live_team_submit',
-      description: 'Submit an immutable report or file artifact for the active task attempt. A refusal here changes nothing about the task.',
+      description: 'Submit an immutable report or file artifact for the active task attempt. Returns the saved submission and per-recipient notifications. Saving is not notification: queued means native admission, not execution or acceptance; pending/failed/unavailable needs attention without resubmitting or blind duplicate sends. Report routes notify current Lead; review routes notify their Reviewer. A refusal before saving changes nothing about the task.',
       parameters: {
         taskId: { type: 'string', required: true },
         artifact: {
@@ -441,30 +472,47 @@ export function registerMemberTools(registry: ToolRegistry, resolve: MemberTools
         summary: { type: 'string', required: true, description: 'One or two sentences: what you changed and what you observed.' },
         checks: { type: 'array', items: { type: 'json' }, description: 'The checks you actually ran: [{"command":"npm test","status":"passed" | "failed","output":"<short tail>"}]. Each entry needs `command` and `status`.' },
       },
-      output: { schema: { type: 'object', additionalProperties: false, properties: { submission: { type: 'json', required: true } } }, render: (_args, value) => renderOutput(value) },
+      output: { schema: { type: 'object', additionalProperties: false, properties: { submission: { type: 'json', required: true }, notifications: { type: 'array', items: { type: 'json' }, required: true } } }, render: (_args, value) => renderOutput(value) },
       execute: async (args: { taskId: string; artifact: { type: 'report' | 'files'; bodyRef?: string; paths?: string[] }; summary: string; checks?: { command: string; status: 'passed' | 'failed'; output?: string }[] }, exec) => {
         const sessionId = sessionIdOf(exec)
         const binding = await resolve(sessionId)
         if (binding === undefined) throw new Error('calling Session is not an active member of this team')
         if (binding.taskStore === undefined) throw new Error('task store is unavailable')
-        const shape = args.artifact === null || typeof args.artifact !== 'object' ? String(args.artifact) : Object.keys(args.artifact as Record<string, unknown>).join(', ')
-        if (args.artifact?.type === 'report' && typeof args.artifact.bodyRef !== 'string') {
+        // The parameter is an opaque `json`, so the host validates nothing and the member's own
+        // spelling arrives here. A trailing newline after "report", or the whole artifact sent as a
+        // JSON string, is the same submission as far as the member is concerned — and refusing it
+        // cost a Builder a blocked task and a long explanation on a live stand.
+        const raw: unknown = args.artifact
+        let artifactInput: { type?: unknown; bodyRef?: unknown; paths?: unknown } | undefined
+        if (typeof raw === 'string') {
+          try { artifactInput = JSON.parse(raw) as { type?: unknown } } catch { artifactInput = undefined }
+        } else if (raw !== null && typeof raw === 'object') {
+          artifactInput = raw as { type?: unknown }
+        }
+        const observed = raw === undefined ? 'undefined' : typeof raw === 'string' ? `a JSON string: ${JSON.stringify(raw.slice(0, 120))}` : JSON.stringify(raw)
+        const declared = typeof artifactInput?.type === 'string' ? artifactInput.type.trim().toLowerCase() : artifactInput?.type
+        const shape = artifactInput === undefined ? observed : Object.keys(artifactInput).join(', ')
+        if (declared === 'report' && typeof artifactInput?.bodyRef !== 'string') {
           throw new Error(`artifact {"type":"report"} needs a string "bodyRef"; received keys: ${shape}. Accepted shapes: {"type":"report","bodyRef":"<path>"} or {"type":"files","paths":["<path>", "…"]}`)
         }
-        if (args.artifact?.type === 'files' && (!Array.isArray(args.artifact.paths) || args.artifact.paths.length === 0 || !args.artifact.paths.every((entry) => typeof entry === 'string'))) {
+        if (declared === 'files' && (!Array.isArray(artifactInput?.paths) || artifactInput.paths.length === 0 || !artifactInput.paths.every((entry) => typeof entry === 'string'))) {
           throw new Error(`artifact {"type":"files"} needs a non-empty "paths" array of strings; received keys: ${shape}. Accepted shapes: {"type":"files","paths":["<path>", "…"]} or {"type":"report","bodyRef":"<path>"}`)
         }
-        if (args.artifact?.type !== 'report' && args.artifact?.type !== 'files') {
-          throw new Error(`artifact must declare its shape with "type":"report" or "type":"files"; received keys: ${shape}. Accepted shapes: {"type":"report","bodyRef":"<path>"} or {"type":"files","paths":["<path>", "…"]}`)
+        if (declared !== 'report' && declared !== 'files') {
+          // Name the value, not only the keys: "received keys: type, bodyRef" told a member nothing
+          // about why a shape it had copied from this very message was refused.
+          throw new Error(`artifact must declare its shape with "type":"report" or "type":"files"; received keys: ${shape}; "type" was ${JSON.stringify(artifactInput?.type)}. Accepted shapes: {"type":"report","bodyRef":"<path>"} or {"type":"files","paths":["<path>", "…"]}`)
         }
-        const artifact = args.artifact.type === 'report' ? { type: 'report' as const, bodyRef: args.artifact.bodyRef as string } : { type: 'files' as const, paths: args.artifact.paths as string[] }
+        const artifact = declared === 'report'
+          ? { type: 'report' as const, bodyRef: (artifactInput?.bodyRef as string).trim() }
+          : { type: 'files' as const, paths: (artifactInput?.paths as string[]).map((entry) => entry.trim()) }
         const result = await binding.taskStore.submitTask({ taskId: args.taskId, memberId: binding.member.memberId, sessionId, bindingGeneration: binding.member.bindingGeneration, artifact, summary: args.summary, checks: args.checks ?? [] })
-        return { submission: jsonRecord(result.submission) }
+        return { submission: jsonRecord(result.submission), notifications: Array.isArray(result.notifications) ? result.notifications.map(jsonRecord) : [] }
       },
     }))
     registry.register(defineTool({
       name: 'live_team_review',
-      description: 'Reviewer only. Review the latest immutable task submission with a terminal verdict. A pass must record at least one check — the command you ran and what it printed — because a verdict that names no command cannot be reproduced; an inspection counts, so record what you looked at.',
+      description: 'Reviewer only. Save a terminal verdict on the latest immutable submission. PASS keeps existing automatic acceptance and notifies current Lead; ESCALATE requests Lead decision; NEEDS_REVISION returns through the existing author/Lead protocol. Inspect notifications: saved verdict is not delivery, queued is native admission not reading/execution, and absent/pending/failed/unavailable is not permission to claim notification or repeat review. PASS needs at least one check you ran, command and observed output; inspection counts.',
       parameters: {
         taskId: { type: 'string', required: true },
         submissionId: { type: 'string', required: true },
@@ -472,22 +520,22 @@ export function registerMemberTools(registry: ToolRegistry, resolve: MemberTools
         findings: { type: 'array', items: { type: 'json' }, description: 'One entry per problem: [{"severity":"low" | "medium" | "high" | "blocker","problem":"…","requiredFix":"…","artifactLocation":"<optional path>"}]. Required for a verdict other than pass.' },
         evidence: { type: 'array', items: { type: 'json' }, description: 'What you ran while judging: [{"command":"npm test","status":"passed" | "failed","output":"<short tail>"}].' },
       },
-      output: { schema: { type: 'object', additionalProperties: false, properties: { round: { type: 'json', required: true }, task: { type: 'json', required: true } } }, render: (_args, value) => renderOutput(value) },
+      output: { schema: { type: 'object', additionalProperties: false, properties: { round: { type: 'json', required: true }, task: { type: 'json', required: true }, notifications: { type: 'array', items: { type: 'json' }, required: true } } }, render: (_args, value) => renderOutput(value) },
       execute: async (args: { taskId: string; submissionId: string; verdict: 'pass' | 'needs_revision' | 'escalate'; findings?: { severity: 'low' | 'medium' | 'high' | 'blocker'; problem: string; requiredFix: string; artifactLocation?: string }[]; evidence?: { command: string; status: 'passed' | 'failed'; output?: string }[] }, exec) => {
         const binding = await resolve(sessionIdOf(exec))
         if (binding === undefined) throw new Error('calling Session is not an active member of this team')
         if (binding.taskStore === undefined) throw new Error('task store is unavailable')
         const result = await binding.taskStore.reviewTask({ taskId: args.taskId, submissionId: args.submissionId, reviewerMemberId: binding.member.memberId, verdict: args.verdict, findings: args.findings ?? [], evidence: args.evidence ?? [] })
-        return { round: jsonRecord(result.round), task: jsonRecord(result.task) }
+        return { round: jsonRecord(result.round), task: jsonRecord(result.task), notifications: (result.notifications ?? []).map(jsonRecord) }
       },
     }))
   }
   if (includeAcceptance) {
     registry.register(defineTool({
       name: 'live_team_accept_task',
-      description: 'Accept a waiting task as the team lead and archive its authored document.',
+      description: 'Accept a waiting task as the team lead and archive its authored document. Inspect notifications for the author handoff: saved acceptance is not delivery; never accept again just to retry a notice.',
       parameters: { taskId: { type: 'string', required: true }, note: { type: 'string' } },
-      output: { schema: { type: 'object', additionalProperties: false, properties: { task: { type: 'json', required: true }, archivedPath: { type: 'string', required: true } } }, render: (_args, value) => renderOutput(value) },
+      output: { schema: { type: 'object', additionalProperties: false, properties: { task: { type: 'json', required: true }, archivedPath: { type: 'string', required: true }, notifications: { type: 'array', items: { type: 'json' }, required: true } } }, render: (_args, value) => renderOutput(value) },
       execute: async (args: { taskId: string; note?: string }, exec) => {
         const binding = await resolve(sessionIdOf(exec))
         if (binding === undefined) throw new Error('calling Session is not an active member of this team')
@@ -495,14 +543,14 @@ export function registerMemberTools(registry: ToolRegistry, resolve: MemberTools
         const leadId = resolveLeadMemberId(binding.team)
         if (binding.member.memberId !== leadId) throw new Error(`only the lead may accept tasks; ask ${leadId ?? 'the lead'}`)
         const result = await binding.taskStore.acceptTask({ taskId: args.taskId, actor: binding.member.memberId, ...(args.note === undefined ? {} : { note: args.note }) })
-        return { task: jsonRecord(result.task), archivedPath: result.archivedPath }
+        return { task: jsonRecord(result.task), archivedPath: result.archivedPath, notifications: (result.notifications ?? []).map(jsonRecord) }
       },
     }))
     registry.register(defineTool({
       name: 'live_team_revise_task',
-      description: 'Return a waiting task to progress with high-priority instructions for its assignee.',
+      description: 'Return a waiting task to progress with high-priority instructions for its assignee. Inspect notifications: saved revision is not delivery; do not revise again just to retry a notice.',
       parameters: { taskId: { type: 'string', required: true }, instructions: { type: 'string', required: true } },
-      output: { schema: { type: 'object', additionalProperties: false, properties: { task: { type: 'json', required: true } } }, render: (_args, value) => renderOutput(value) },
+      output: { schema: { type: 'object', additionalProperties: false, properties: { task: { type: 'json', required: true }, notifications: { type: 'array', items: { type: 'json' }, required: true } } }, render: (_args, value) => renderOutput(value) },
       execute: async (args: { taskId: string; instructions: string }, exec) => {
         const binding = await resolve(sessionIdOf(exec))
         if (binding === undefined) throw new Error('calling Session is not an active member of this team')
@@ -510,7 +558,7 @@ export function registerMemberTools(registry: ToolRegistry, resolve: MemberTools
         const leadId = resolveLeadMemberId(binding.team)
         if (binding.member.memberId !== leadId) throw new Error(`only the lead may revise tasks; ask ${leadId ?? 'the lead'}`)
         const result = await binding.taskStore.reviseTask({ taskId: args.taskId, actor: binding.member.memberId, instructions: args.instructions })
-        return { task: jsonRecord(result.task) }
+        return { task: jsonRecord(result.task), notifications: (result.notifications ?? []).map(jsonRecord) }
       },
     }))
   }

@@ -134,8 +134,11 @@ export function evaluateTask(input: GateInput): DispatchEvaluation {
   // above the mark — because judging such an attempt against the old contract is exactly
   // the confusion this rule exists to prevent.
   const own = unresolvedIntervention(task, attempts)
-  if (own !== undefined) return verdict('human-intervened', `a human wrote into ${memberName(team, own.memberId)}'s Session directly (attempt ${own.id}); record the change in the contract, or accept/revise the task, before the dispatcher continues`)
-  if (task.status === 'waiting') return verdict('human-gate', 'the member is waiting for an answer')
+  if (own !== undefined) return verdict('human-intervened', `a human wrote into ${memberName(team, own.memberId)}'s Session directly (attempt ${own.id}); resolve the intervention by accepting/revising an undecided submission, revoking then editing and explicitly resuming parked work, or cancelling the task; the in-flight contract is frozen`)
+  // `waiting` means the submission is in and a decision is owed — by the reviewer, or by the lead
+  // after an escalation. It does not mean the member is stuck waiting for a reply: on a real stand
+  // that wording made a healthy submitted task read as a hung member.
+  if (task.status === 'waiting') return verdict('human-gate', 'the submission is waiting for a decision: the reviewer, or the lead after an escalation')
   if (task.status === 'needs_human') return verdict('human-gate', 'the task needs a human decision')
   // A running attempt is more informative than "not ready": it says who holds the work.
   if (attempt?.status === 'active') {
@@ -247,7 +250,8 @@ export function assignmentText(task: TeamTask, attempt: TaskAttempt, team: TeamS
     `- Round limit: ${task.roundLimit}`,
     `- Human contact: ${contact}`,
     `- Document: ${taskDocumentPath(workspacePath, task.teamId, task.id)}`,
-    `Read it with live_team_read_task, then acknowledge it with live_team_ack_task before you start work.`,
+    `Read current state with live_team_read_task before any action. This queued notification may be stale: only proceed if task ${task.id} is claimed/in_progress, your active attempt is still ${attempt.id}, and there is no newer submission. Ignore closed, archived, replaced or already-submitted work; never revive it or overwrite newer/human instructions.`,
+    `If still current, acknowledge through live_team_ack_task before starting. Do not send a peer acknowledgement or waiting/progress message to the lead.`,
     'Report a blocker with live_team_send to your lead rather than working around it.',
   ].join('\n')
 }
@@ -279,6 +283,10 @@ export type DispatcherPorts = {
   taskStore: Pick<TaskStore, 'listTasks' | 'readAttempts' | 'claimTask' | 'markHumanIntervention' | 'closeTerminalAttempts' | 'pruneSnapshots' | 'markAttemptStalled' | 'reconcilePendingIntegrations'>
   mailbox: Pick<MailboxService, 'listMessages' | 'listDeliveries' | 'sendFromScheduler' | 'retryExpiredLeases' | 'retryDelivery' | 'deliver' | 'healOrphanMessages'>
   appendAudit: DispatchAudit
+  recoverReviewReturns?: () => Promise<void>
+  recoverSubmissionNotifications?: () => Promise<void>
+  recoverLifecycleNotifications?: () => Promise<void>
+  recoverObsoleteAssignments?: () => Promise<void>
   /** Whether this deployment starts coding work on its own; `manual` by default. */
   codingDispatch?: CodingDispatch
   /** Extra shared hotspots, on top of the built-in list. */
@@ -558,8 +566,12 @@ export function createDispatcher(ports: DispatcherPorts): Dispatcher {
     // The wake half runs even when dispatch is paused: a message already queued for
     // a member must still reach that member. Pausing starts is not a takeover.
     await healTerminalAttempts()
-    await wakeHalf(result)
     await observeInterventions(result)
+    await ports.recoverObsoleteAssignments?.()
+    await wakeHalf(result)
+    await ports.recoverReviewReturns?.()
+    await ports.recoverSubmissionNotifications?.()
+    await ports.recoverLifecycleNotifications?.()
     await observeStalledAttempts(state, result)
     if (dispatch.mode === 'auto') await startHalf(state, result)
     return result

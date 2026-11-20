@@ -2,10 +2,14 @@ import { promises as fs, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { ERROR_CODES, LiveTeamsError } from './errors.js'
-import { atomicWrite, atomicWriteJson, clone, fileExists, readJson, withProcessLock, CURRENT_SCHEMA_VERSION } from './storage.js'
+import { atomicWrite, atomicWriteJson, clone, fileExists, readJson, withProcessLock, CURRENT_SCHEMA_VERSION, TASKS_SCHEMA_VERSION } from './storage.js'
 import { CODING_KINDS, literalPrefix, MAX_PATHS, normalizeScope, normalizeScopePath, outsideScope, scopesIntersect } from './scope.js'
 import { diffSnapshots } from './tree-snapshot.js'
+import { diagnosePaths, type PathWarning } from './path-diagnostics.js'
+import { parseReviewReturn, reviewReturnNoticeClass, type ReviewReturn } from './review-return-state.js'
+import { lifecycleIntent, withLifecycleIntent, validateLifecycleNotices, type LifecycleNoticeIntent, type LifecycleNoticeRequest, type LifecycleNoticeFence } from './lifecycle-notice.js'
 import { MIGRATIONS, applyMigration, planMigration, type Migration } from './migrations.js'
+import { resolveLeadMemberId } from './team-store.js'
 import { TEAM_ROOT, type MemberRecord, type TeamState } from './team-store.js'
 
 export type TaskKind = 'work' | 'research' | 'requirements' | 'implementation' | 'verification' | 'review' | 'repair' | 'integration'
@@ -19,7 +23,23 @@ export type TaskRoute =
 /** The durable task shape deliberately leaves room for later Phase 4 fields. */
 export type HumanContact = 'none' | 'expected' | 'required'
 
+export type { ReviewReturn } from './review-return-state.js'
+export interface ReviewReturnRequest {
+  taskId: string
+  title: string
+  leadMemberId: string
+  leadSessionId?: string
+  leadBindingGeneration?: number
+  leadStillCurrent?: () => Promise<boolean>
+  intent: ReviewReturn
+  round: ReviewRound
+  /** Recheck the attempt capability immediately before an external enqueue. */
+  stillCurrent: () => Promise<boolean>
+}
+
 export interface TeamTask {
+  /** Prospective durable handoff only; historical reviews have no return intent. */
+  reviewReturn?: ReviewReturn
   id: string
   teamId: string
   title: string
@@ -76,6 +96,24 @@ export interface TeamTask {
    * "the branch moved but the task was never completed" from "nothing happened" (review finding 1).
    */
   integrationPending?: { baseRef: string; headSha: string; baseTipSha: string; at: number; reportedAt?: number }
+  /**
+   * A submission is in and nobody has decided on it: the lead or the human owes an accept or a
+   * return. Kept as a fact on the task rather than derived from the status, because the status also
+   * says `in_progress` after a return — and both the store and the panel read the status and
+   * concluded there was nothing to decide while a submission sat on the table (found on a real
+   * stand: the human had only "Release attempt" and the lead's accept was refused).
+   */
+  awaitsDecision?: boolean
+  /** Prospective notification intent; mailbox/command rows retain the delivery receipt. */
+  submissionNoticeId?: string
+  /** Prospective existing lifecycle handoffs; delivery records live in the mailbox outbox. */
+  lifecycleNotices?: LifecycleNoticeIntent[]
+}
+
+/** Submission accepts claimed work too; notification eligibility must preserve that protocol.
+ * Marker opt-in, route, recipient and binding fences are checked by their existing callers. */
+function submissionAwaitsDecision(task: TeamTask | undefined, submissionId = task?.latestSubmissionId): task is TeamTask {
+  return task !== undefined && task.latestSubmissionId !== undefined && task.latestSubmissionId === submissionId && task.awaitsDecision === true && task.archivedPath === undefined && ['claimed', 'in_progress', 'waiting'].includes(task.status)
 }
 
 export interface TaskAttempt {
@@ -175,7 +213,7 @@ export interface UpdateTaskRequest {
   paths?: readonly string[] | null
 }
 
-export type UpdateTaskResult = { readonly task: TeamTask; readonly document: string; readonly changed: readonly string[] }
+export type UpdateTaskResult = { readonly task: TeamTask; readonly document: string; readonly changed: readonly string[]; readonly warnings?: readonly PathWarning[] }
 
 /**
  * Take work away from its current attempt (B28).
@@ -362,6 +400,7 @@ export interface AcceptTaskRequest {
 }
 
 export interface AcceptTaskResult {
+  notifications?: SubmissionNotificationReceipt[]
   task: TeamTask
   archivedPath: string
 }
@@ -373,6 +412,7 @@ export interface ReviseTaskRequest {
 }
 
 export interface ReviseTaskResult {
+  notifications?: SubmissionNotificationReceipt[]
   task: TeamTask
 }
 
@@ -386,6 +426,7 @@ export interface ReviewTaskRequest {
 }
 
 export interface ReviewTaskResult {
+  notifications?: SubmissionNotificationReceipt[]
   round: ReviewRound
   task: TeamTask
 }
@@ -411,19 +452,59 @@ export interface ReadTaskResult {
 export interface CreateTaskResult {
   task: TeamTask
   documentPath: string
+  warnings?: readonly PathWarning[]
 }
 
 export interface ListTasksOptions {
   includeArchived?: boolean
 }
 
+export type SubmissionNotificationReceipt = {
+  recipient?: string
+  purpose: 'lead-acceptance' | 'review' | 'review-return' | 'review-return-lead' | LifecycleNoticeIntent['kind']
+  state: 'queued' | 'pending' | 'failed' | 'unavailable' | 'superseded'
+  messageId?: string
+  requestId?: string
+  sessionId?: string
+  bindingGeneration?: number
+  reason?: string
+}
+export type SubmissionNotificationRequest = {
+  taskId: string; submissionId: string; assignee: string; summary: string
+  recipient: string; purpose: 'lead-acceptance' | 'review'; sessionId: string; bindingGeneration: number
+  stillCurrent: () => Promise<boolean>
+}
+
 type TaskStoreOptions = {
+  deliverLifecycleNotice?: (request: LifecycleNoticeRequest) => Promise<SubmissionNotificationReceipt>
+  deliverSubmissionNotice?: (request: SubmissionNotificationRequest) => Promise<SubmissionNotificationReceipt>
+
   workspacePath: string
   teamId: string
   appendAudit?: (event: unknown) => Promise<void>
   deliverEscalation?: (request: { leadMemberId: string; taskId: string; submissionId: string; round: ReviewRound; reviewerMemberId: string; problem: string; tried: string }) => Promise<void>
   deliverClosing?: (request: { assignee: string; taskId: string; note?: string }) => Promise<void>
+  /**
+   * Tell the reviewer that a submission is waiting.
+   *
+   * Handing the submission over is the member's job by contract, and a member that forgets leaves the
+   * work sitting: on a real stand one submission waited six and a half minutes for a human to notice,
+   * while the member that did message its reviewer was accepted in thirty-one seconds. The route is
+   * frozen in the task's contract once work starts, so this can only go where the lead sent it.
+   */
+  deliverReviewRequest?: (request: { reviewer: string; assignee: string; taskId: string; submissionId: string; summary: string }) => Promise<void>
+  /**
+   * Tell the assignee that the task was closed by hand.
+   *
+   * Closing ends the attempt, and a member whose Session is waiting for a next task is never told by
+   * the state change alone: acceptance has always delivered a closing message, and closing needs the
+   * same, with the reason.
+   */
+  deliverCancellation?: (request: { assignee: string; taskId: string; reason: string }) => Promise<void>
   deliverDirection?: (request: { assignee: string; taskId: string; instructions: string }) => Promise<void>
+  deliverReviewReturn?: (request: ReviewReturnRequest) => Promise<{ messageId: string; requestId: string; pending?: boolean }>
+  observeReviewReturn?: (request: ReviewReturnRequest) => Promise<{ state: 'pending' | 'started' | 'completed' | 'failed' | 'unobservable'; turn?: number; inputSeq?: number; reason?: string }>
+  notifyReviewReturn?: (request: ReviewReturnRequest) => Promise<SubmissionNotificationReceipt | void>
   /**
    * Ask a Session to stop. Absent means the store cannot interrupt, and a
    * revocation then refuses rather than pretending the session was stopped.
@@ -438,6 +519,11 @@ type TaskStoreOptions = {
    * rather than as a clean result. The store never shells out itself.
    */
   changedPaths?: (workspacePath: string) => Promise<readonly string[] | undefined>
+  /**
+   * What the member committed since the attempt's base. Optional: without it the scope sees the
+   * working tree only, which is the behaviour that refused a member who committed its work.
+   */
+  committedPaths?: (workspacePath: string, base: string) => Promise<readonly string[] | undefined>
   /**
    * B32: which observation this workspace supports. Absent means the composition cannot
    * tell, and a scope record says `unchecked (unreadable)` rather than reading as clean.
@@ -645,6 +731,11 @@ function validateTaskRecord(value: unknown, teamId: string, archiveDirectory?: s
     || !Number.isInteger(candidate.revision) || Number(candidate.revision) < 1) {
     throw new LiveTeamsError(ERROR_CODES.STATE_CORRUPT, 'invalid task record')
   }
+  if (candidate.lifecycleNotices !== undefined) validateLifecycleNotices(candidate.lifecycleNotices)
+  if (candidate.submissionNoticeId !== undefined && (typeof candidate.submissionNoticeId !== 'string' || !candidateId(candidate.submissionNoticeId) || candidate.submissionNoticeId !== candidate.latestSubmissionId)) throw new LiveTeamsError(ERROR_CODES.STATE_CORRUPT, 'invalid submission notification intent')
+  if (candidate.reviewReturn !== undefined) {
+    try { parseReviewReturn(candidate.reviewReturn) } catch { throw new LiveTeamsError(ERROR_CODES.STATE_CORRUPT, 'invalid task review return metadata') }
+  }
   return candidate as unknown as TeamTask
 }
 
@@ -652,11 +743,11 @@ function parseTasksState(value: unknown, teamId: string, archiveDirectory?: stri
   const candidate = objectRecord(value)
   // Both numbers in the refusal: a state from a newer DSH is not corruption, and saying which
   // versions are involved is the difference between updating the product and hunting a bug.
-  if (candidate !== undefined && Number.isInteger(candidate.schemaVersion) && Number(candidate.schemaVersion) !== CURRENT_SCHEMA_VERSION) {
-    const plan = planMigration(candidate.schemaVersion, CURRENT_SCHEMA_VERSION, 'task state')
+  if (candidate !== undefined && Number.isInteger(candidate.schemaVersion) && Number(candidate.schemaVersion) !== TASKS_SCHEMA_VERSION) {
+    const plan = planMigration(candidate.schemaVersion, TASKS_SCHEMA_VERSION, 'task state')
     if (plan.kind === 'future') throw plan.error
   }
-  if (candidate === undefined || !Number.isInteger(candidate.schemaVersion) || Number(candidate.schemaVersion) > CURRENT_SCHEMA_VERSION
+  if (candidate === undefined || !Number.isInteger(candidate.schemaVersion) || Number(candidate.schemaVersion) > TASKS_SCHEMA_VERSION
     || candidate.teamId !== teamId || !Number.isInteger(candidate.revision) || Number(candidate.revision) < 0 || !Array.isArray(candidate.tasks)) {
     throw new LiveTeamsError(ERROR_CODES.STATE_CORRUPT, 'invalid task state')
   }
@@ -811,6 +902,29 @@ export function deriveRouteContacts(task: TeamTask, team: TeamState): string[] {
   return []
 }
 
+/**
+ * Who a member may address, from one rule.
+ *
+ * Three places need this answer: the mailbox decides whether to deliver, the injected context tells
+ * the member who it may talk to, and the panel shows the same list. Each had its own copy, and the
+ * panel's was the narrowest — it showed the lead "contact with colleagues is not allowed" while the
+ * mailbox was happily delivering the lead's messages to everyone (found on a real stand).
+ *
+ * The rule itself: the lead may address every member; anyone else may address the lead, whoever a
+ * grant names, and whoever an active task's route opens — the same set the mailbox enforces.
+ */
+export function permittedContacts(state: TeamState, memberId: string, tasks: readonly TeamTask[]): string[] {
+  const leadId = resolveLeadMemberId(state)
+  const others = state.members.map((member) => member.memberId).filter((id) => id !== memberId)
+  if (leadId !== undefined && memberId === leadId) return [...others, 'team', 'human']
+  const grants = (state.contactGrants ?? []).filter((grant) => grant.from === memberId).map((grant) => grant.to)
+  const derived = others.filter((target) => tasks.some((task) => routeAllowsContact(task, memberId, target, state)))
+  const human = tasks.some((task) => routeAllowsContact(task, memberId, 'human', state)) ? ['human'] : []
+  const allowed = new Set<string>([...(leadId === undefined ? [] : [leadId]), ...grants, ...derived, ...human])
+  allowed.delete(memberId)
+  return [...allowed]
+}
+
 export function routeAllowsContact(task: TeamTask, from: string, to: string, team: TeamState): boolean {
   if (task.assignee === undefined || task.route === undefined || !['ready', 'claimed', 'in_progress', 'waiting', 'needs_human'].includes(task.status)) return false
   if (task.route.type === 'report') return from === task.assignee && task.route.to === to
@@ -853,11 +967,23 @@ export class TaskStore {
   private readonly appendAudit: (event: unknown) => Promise<void>
   private readonly deliverEscalation?: TaskStoreOptions['deliverEscalation']
   private readonly deliverClosing?: TaskStoreOptions['deliverClosing']
+  private readonly deliverReviewRequest?: TaskStoreOptions['deliverReviewRequest']
+  private readonly deliverSubmissionNotice?: TaskStoreOptions['deliverSubmissionNotice']
+  private readonly deliverLifecycleNotice?: TaskStoreOptions['deliverLifecycleNotice']
+  private lifecycleCursor = 0
+  private submissionNoticeCursor = 0
+  private readonly deliverCancellation?: TaskStoreOptions['deliverCancellation']
   private readonly deliverDirection?: TaskStoreOptions['deliverDirection']
+  private readonly deliverReviewReturn?: TaskStoreOptions['deliverReviewReturn']
+  private readonly observeReviewReturn?: TaskStoreOptions['observeReviewReturn']
+  private readonly notifyReviewReturn?: TaskStoreOptions['notifyReviewReturn']
+  private readonly reviewReturnRuns = new Map<string, Promise<void>>()
+  private reviewReturnCursor = 0
   private readonly interruptSession?: TaskStoreOptions['interruptSession']
   private readonly awaitQuiescence?: TaskStoreOptions['awaitQuiescence']
   private readonly quiescenceTimeoutMs: number
   private readonly changedPaths: TaskStoreOptions['changedPaths']
+  private readonly committedPaths: TaskStoreOptions['committedPaths']
   private readonly git: TaskStoreOptions['git']
   private readonly migrations: Readonly<Record<number, Migration>>
   private readonly workspaceMode: TaskStoreOptions['workspaceMode']
@@ -868,11 +994,19 @@ export class TaskStore {
   constructor(options: TaskStoreOptions) {
     this.deliverEscalation = options.deliverEscalation
     this.deliverClosing = options.deliverClosing
+    this.deliverReviewRequest = options.deliverReviewRequest
+    this.deliverSubmissionNotice = options.deliverSubmissionNotice
+    this.deliverLifecycleNotice = options.deliverLifecycleNotice
+    this.deliverCancellation = options.deliverCancellation
     this.deliverDirection = options.deliverDirection
+    this.deliverReviewReturn = options.deliverReviewReturn
+    this.observeReviewReturn = options.observeReviewReturn
+    this.notifyReviewReturn = options.notifyReviewReturn
     this.interruptSession = options.interruptSession
     this.awaitQuiescence = options.awaitQuiescence
     this.quiescenceTimeoutMs = options.quiescenceTimeoutMs ?? 5000
     this.changedPaths = options.changedPaths
+    this.committedPaths = options.committedPaths
     this.git = options.git
     this.migrations = options.migrations ?? MIGRATIONS
     this.workspaceMode = options.workspaceMode
@@ -962,19 +1096,31 @@ export class TaskStore {
     return withProcessLock(this.location.teamFile, async () => this.readReviewsIfPresentLocked())
   }
 
+  private ownedTaskForMember(tasks: readonly TeamTask[], attempts: readonly TaskAttempt[], memberId: string): TeamTask | undefined {
+    // Assignment is a capability held by a current attempt, not merely a name on queued work.
+    // A newer ready task must never displace the task this member is actually working on.
+    const owned = tasks.filter((task) => task.assignee === memberId
+      && task.archivedPath === undefined
+      && ['claimed', 'in_progress', 'waiting', 'needs_human'].includes(task.status)
+      && attempts.some((attempt) => attempt.id === task.activeAttemptId && attempt.taskId === task.id
+        && attempt.memberId === memberId && (attempt.status === 'active' || attempt.status === 'revoking')))
+    owned.sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))
+    return owned[0] === undefined ? undefined : clone(owned[0])
+  }
+
   async activeTaskForMember(memberId: string): Promise<TeamTask | undefined> {
-    const state = await withProcessLock(this.location.teamFile, async () => this.readOrCreateLocked())
-    const active = state.tasks.filter((task) => task.assignee === memberId && ['ready', 'claimed', 'in_progress', 'waiting', 'needs_human'].includes(task.status))
-    active.sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))
-    return active[0] === undefined ? undefined : clone(active[0])
+    return withProcessLock(this.location.teamFile, async () => {
+      const state = await this.readTasksIfPresentLocked()
+      const attempts = await this.readAttemptsIfPresentLocked()
+      return this.ownedTaskForMember(state.tasks, attempts.attempts, memberId)
+    })
   }
 
   activeTaskForMemberSync(memberId: string): TeamTask | undefined {
     try {
       const state = parseTasksState(JSON.parse(readFileSync(this.location.file, 'utf8')) as unknown, this.teamId, this.location.archiveDirectory)
-      const active = state.tasks.filter((task) => task.assignee === memberId && ['ready', 'claimed', 'in_progress', 'waiting', 'needs_human'].includes(task.status))
-      active.sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))
-      return active[0] === undefined ? undefined : clone(active[0])
+      const attempts = parseAttemptsState(JSON.parse(readFileSync(this.location.attemptsFile, 'utf8')) as unknown, this.teamId)
+      return this.ownedTaskForMember(state.tasks, attempts.attempts, memberId)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
       throw error
@@ -1065,10 +1211,11 @@ export class TaskStore {
     return task === undefined ? undefined : task.contractRevision ?? 0
   }
 
-  async submitTask(request: SubmitTaskRequest): Promise<{ submission: Submission }> {
+  async submitTask(request: SubmitTaskRequest): Promise<{ submission: Submission; notifications: SubmissionNotificationReceipt[] }> {
     if (!candidateId(request.taskId) || request.memberId.length === 0 || request.sessionId.length === 0 || !Number.isInteger(request.bindingGeneration)) fail('invalid submission request')
     if (typeof request.summary !== 'string' || request.summary.trim().length === 0) fail('submission summary must be non-empty')
-    return withProcessLock(this.location.teamFile, async () => {
+    let handoff: { reviewer: string; assignee: string; taskId: string; submissionId: string; summary: string } | undefined
+    const result = await withProcessLock(this.location.teamFile, async () => {
       const tasks = await this.readTasksIfPresentLocked()
       const task = tasks.tasks.find((entry) => entry.id === request.taskId)
       if (task === undefined) fail(`task not found: ${request.taskId}`)
@@ -1107,7 +1254,10 @@ export class TaskStore {
         // for a report they are what it actually changed inside its declaration. Only these paths
         // are replaced in the tree, which is exactly why the refresh check below is about them.
         const commitPaths = artifact.type === 'files' ? artifact.paths : (scope?.changed ?? []).filter((entry) => !(scope?.unexpected ?? []).includes(entry))
-        if (commitPaths.length === 0) fail('nothing changed under the declaration and the submission names no files; there is nothing to review')
+        // Say what to do, not only what is wrong: a member that committed its work has a clean tree,
+        // and a report carries no paths, so the message has to name the way out. On a real stand a
+        // Builder read the plugin's source to find it.
+        if (commitPaths.length === 0) fail('nothing changed under the declaration and the submission names no files; there is nothing to review. If you committed your work, submit it as a file artifact naming those files ({"type":"files","paths":["…"]}) — a report carries no paths, so a clean tree leaves nothing behind')
         // The base recorded at claim time can already have moved by the time the work is frozen —
         // the fourth live round lost a task to a sibling's integration landing 1.1 seconds before the
         // submission. When the movement cannot touch this work, the commit is parented on the base
@@ -1159,7 +1309,7 @@ export class TaskStore {
       if (git !== undefined && scope !== undefined) scope.committed = [...git.commitPaths]
       const submission: Submission = { id: `submission-${randomUUID()}`, taskId: task.id, attemptId: attempt.id, attemptGeneration: attempt.generation, artifact, ...(git === undefined ? {} : { git }), summary: request.summary, checks: request.checks.map(validateCheck), ...(scope === undefined ? {} : { scope }), createdAt: now, revision: submissions.revision + 1 }
       const nextSubmissions: SubmissionsState = { ...submissions, schemaVersion: CURRENT_SCHEMA_VERSION, revision: submissions.revision + 1, submissions: [...submissions.submissions, submission] }
-      const nextTask: TeamTask = { ...task, latestSubmissionId: submission.id, ...(task.route?.type === 'report' ? { status: 'waiting' as const } : {}), updatedAt: now, revision: task.revision + 1 }
+      const nextTask: TeamTask = { ...task, latestSubmissionId: submission.id, submissionNoticeId: submission.id, ...(task.reviewReturn === undefined ? {} : { reviewReturn: { ...task.reviewReturn, state: 'superseded', reason: 'new-submission', leadNotified: false } }), awaitsDecision: true, ...(task.route?.type === 'report' ? { status: 'waiting' as const } : {}), updatedAt: now, revision: task.revision + 1 }
       const nextTasks: TasksState = { ...tasks, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === task.id ? nextTask : entry) }
       await atomicWriteJson(this.location.submissionsFile, nextSubmissions)
       try { await atomicWriteJson(this.location.file, nextTasks) } catch (error) { await atomicWriteJson(this.location.submissionsFile, submissions); throw error }
@@ -1172,8 +1322,161 @@ export class TaskStore {
       if (scope?.state === 'shared-tree') {
         await this.appendAudit({ kind: 'submission/scope-shared-tree', taskId: task.id, submissionId: submission.id, attemptId: attempt.id, declared: scope.declared, unexpected: scope.unexpected ?? [], sharedTree: scope.sharedTree ?? [], actor: request.memberId, at: now, revision: submissions.revision + 1 })
       }
+      // Collected here, delivered after the lock: the mailbox takes its own locks, and calling it
+      // from inside this one deadlocks the whole store. The acceptance path does the same.
+      handoff = task.route !== undefined && task.route.type === 'review'
+        ? { reviewer: task.route.reviewer, assignee: request.memberId, taskId: task.id, submissionId: submission.id, summary: submission.summary }
+        : undefined
       return { submission: clone(submission) }
     })
+    if (this.deliverSubmissionNotice === undefined && handoff !== undefined) {
+      // Legacy ports return no receipt: never pretend their best-effort callback proves admission.
+      try { await this.deliverReviewRequest?.(handoff) } catch { /* explicit unavailable receipt below */ }
+    }
+    return { ...result, notifications: await this.processSubmissionNotification(request.taskId) }
+  }
+
+  private async lifecycleSnapshot(taskId: string, intentId: string) {
+    return withProcessLock(this.location.teamFile, async () => {
+      if (await fileExists(path.join(this.location.directory, 'disabled'))) return undefined
+      const task = (await this.readTasksIfPresentLocked()).tasks.find(entry => entry.id === taskId)
+      const intent = task?.lifecycleNotices?.find(entry => entry.id === intentId)
+      if (task === undefined || intent === undefined || task.contractRevision !== intent.contractRevision) return undefined
+      const team = await this.readTeamLocked()
+      let recipient = intent.assignee
+      let authorBinding: { sessionId: string; bindingGeneration: number } | undefined
+      let detail = ''
+      if (intent.kind === 'review-verdict') {
+        const rounds = (await this.readReviewsIfPresentLocked()).rounds.filter(entry => entry.taskId === taskId).sort((a, b) => a.round - b.round)
+        const round = rounds.at(-1)
+        if (round === undefined || round.id !== intent.roundId || round.submissionId !== intent.submissionId || task.latestSubmissionId !== intent.submissionId || !['pass', 'escalate'].includes(round.verdict) || round.verdict === 'pass' && (task.status !== 'completed' || task.acceptedSubmissionId !== intent.submissionId) || round.verdict === 'escalate' && !['waiting', 'needs_human'].includes(task.status)) return undefined
+        recipient = resolveLeadMemberId(team)
+        detail = `Формальный вердикт: ${round.verdict.toUpperCase()}, раунд ${round.round} (${round.id}).\nSubmission: ${round.submissionId}.\n${round.verdict === 'pass' ? 'Работа уже принята по PASS и задача завершена; повторная приёмка не требуется.' : 'Reviewer запросил решение Lead; прочитай формальные findings перед решением.'}\nЗамечаний: ${round.findings.length}. Полные findings и evidence — в формальном вердикте.`
+      } else if (intent.kind === 'acceptance') {
+        if (task.status !== 'completed' || task.acceptedSubmissionId !== intent.submissionId) return undefined
+        detail = `Сдача ${intent.submissionId} принята; задача завершена.${intent.text ? `\nПримечание Lead: ${intent.text}` : ''}\nЭто закрытие только указанной задачи; не останавливай и не возобновляй другие назначения.`
+      } else if (intent.kind === 'cancellation') {
+        if (task.status !== 'cancelled') return undefined
+        detail = `Задача отменена без приёмки. Причина: ${intent.text}\nЭто закрытие только указанной задачи; не останавливай другие назначения.`
+      } else {
+        const attempt = (await this.readAttemptsIfPresentLocked()).attempts.find(entry => entry.id === task.activeAttemptId)
+        if (task.status !== 'in_progress' || task.awaitsDecision === true || task.activeAttemptId !== intent.attemptId || attempt?.status !== 'active' || attempt.memberId !== intent.assignee || task.assignee !== intent.assignee) return undefined
+        authorBinding = { sessionId: attempt.sessionId, bindingGeneration: attempt.bindingGeneration }
+        detail = `Указание Lead: ${intent.text}\nПродолжай только если актуальны попытка ${intent.attemptId} и contractRevision ${intent.contractRevision}; не меняй контракт самостоятельно.`
+      }
+      const member = recipient === undefined ? undefined : memberById(team, recipient)
+      if (authorBinding !== undefined && member?.sessionId !== undefined && (member.sessionId !== authorBinding.sessionId || member.bindingGeneration !== authorBinding.bindingGeneration)) return undefined
+      const content = `Событие задачи: ${task.title} (${taskId}).\n${detail}\nСначала проверь актуальную задачу, последнюю сдачу и формальные решения через live_team_read_task. Устаревшее уведомление не является новым поручением. Подтверждать получение или повторять evidence сообщением не требуется.`
+      return { taskId, intent, recipient, sessionId: member?.sessionId, bindingGeneration: member?.bindingGeneration, content }
+    })
+  }
+
+  async isLifecycleNoticeCurrent(fence: LifecycleNoticeFence): Promise<boolean> {
+    const snapshot = await this.lifecycleSnapshot(fence.taskId, fence.intentId)
+    return snapshot !== undefined && snapshot.recipient === fence.recipient && snapshot.sessionId === fence.sessionId && snapshot.bindingGeneration === fence.bindingGeneration
+  }
+
+  private async processLifecycleNotification(taskId: string, intentId: string, kind: LifecycleNoticeIntent['kind']): Promise<SubmissionNotificationReceipt> {
+    const snapshot = await this.lifecycleSnapshot(taskId, intentId)
+    if (snapshot === undefined) return { purpose: kind, state: 'superseded', reason: 'lifecycle-action-no-longer-current' }
+    const { recipient, sessionId, bindingGeneration, intent } = snapshot
+    const base = { purpose: intent.kind, ...(recipient === undefined ? {} : { recipient }) }
+    if (recipient === undefined || sessionId === undefined || bindingGeneration === undefined || this.deliverLifecycleNotice === undefined) return { ...base, state: 'unavailable', reason: recipient === undefined ? 'recipient-unavailable' : sessionId === undefined || bindingGeneration === undefined ? 'binding-unavailable' : 'notification-port-unavailable' }
+    const fence: LifecycleNoticeFence = { taskId, intentId, recipient, sessionId, bindingGeneration }
+    try {
+      const receipt = await this.deliverLifecycleNotice({ ...snapshot, recipient, sessionId, bindingGeneration, stillCurrent: async () => this.isLifecycleNoticeCurrent(fence) })
+      if (receipt.recipient !== recipient || receipt.purpose !== intent.kind || !['queued', 'pending', 'failed', 'unavailable', 'superseded'].includes(receipt.state) || receipt.state === 'queued' && (!receipt.messageId || !receipt.requestId)) return { ...base, state: 'failed', reason: 'invalid-notification-receipt' }
+      return receipt
+    } catch { return await this.isLifecycleNoticeCurrent(fence) ? { ...base, state: 'failed', reason: 'notification-error' } : { ...base, state: 'superseded', reason: 'lifecycle-action-no-longer-current' } }
+  }
+
+  async processLifecycleNotifications(taskId: string, kind: LifecycleNoticeIntent['kind']): Promise<SubmissionNotificationReceipt[]> {
+    const intents = await withProcessLock(this.location.teamFile, async () => (await this.readTasksIfPresentLocked()).tasks.find(task => task.id === taskId)?.lifecycleNotices?.filter(intent => intent.kind === kind) ?? [])
+    return Promise.all(intents.map(intent => this.processLifecycleNotification(taskId, intent.id, intent.kind)))
+  }
+
+  async recoverLifecycleNotifications(limit = 8): Promise<void> {
+    if (this.deliverLifecycleNotice === undefined) return
+    const candidates = await withProcessLock(this.location.teamFile, async () => (await this.readTasksIfPresentLocked()).tasks.flatMap(task => (task.lifecycleNotices ?? []).map(intent => ({ taskId: task.id, intentId: intent.id, kind: intent.kind }))))
+    const count = Math.min(candidates.length, Math.max(1, limit))
+    for (let i = 0; i < count; i++) { const next = candidates[(this.lifecycleCursor + i) % candidates.length]!; await this.processLifecycleNotification(next.taskId, next.intentId, next.kind) }
+    this.lifecycleCursor = candidates.length === 0 ? 0 : (this.lifecycleCursor + count) % candidates.length
+  }
+
+  async requestReviewNotification(taskId: string, roundId: string, actor: string): Promise<SubmissionNotificationReceipt[]> {
+    await withProcessLock(this.location.teamFile, async () => {
+      const team = await this.readTeamLocked()
+      if (!isLeadOrHuman(team, actor)) fail('only the lead or human may request a verdict handoff')
+      const tasks = await this.readTasksIfPresentLocked()
+      const task = tasks.tasks.find(entry => entry.id === taskId)
+      const round = (await this.readReviewsIfPresentLocked()).rounds.filter(entry => entry.taskId === taskId).sort((a, b) => a.round - b.round).at(-1)
+      if (task === undefined || round?.id !== roundId || task.latestSubmissionId !== round.submissionId || !['pass', 'escalate'].includes(round.verdict) || round.verdict === 'pass' && (task.status !== 'completed' || task.acceptedSubmissionId !== round.submissionId) || round.verdict === 'escalate' && !['waiting', 'needs_human'].includes(task.status)) fail('verdict no longer matches current task outcome')
+      if (task.lifecycleNotices?.some(intent => intent.kind === 'review-verdict' && intent.roundId === roundId)) return
+      const next = withLifecycleIntent(task, lifecycleIntent('review-verdict', task.contractRevision ?? 0, { roundId, submissionId: round.submissionId }))
+      await atomicWriteJson(this.location.file, { ...tasks, revision: tasks.revision + 1, tasks: tasks.tasks.map(entry => entry.id === taskId ? { ...next, revision: task.revision + 1, updatedAt: Date.now() } : entry) })
+      await this.appendAudit({ kind: 'review/notification-requested', taskId, roundId, actor, at: Date.now() })
+    })
+    return this.processLifecycleNotifications(taskId, 'review-verdict')
+  }
+
+  private async submissionNotificationSnapshot(taskId: string) {
+    return withProcessLock(this.location.teamFile, async () => {
+      if (await fileExists(path.join(this.location.directory, 'disabled'))) return undefined
+      const task = (await this.readTasksIfPresentLocked()).tasks.find(entry => entry.id === taskId)
+      if (!submissionAwaitsDecision(task) || task.submissionNoticeId === undefined || task.submissionNoticeId !== task.latestSubmissionId || task.route === undefined) return undefined
+      const submission = (await this.readSubmissionsIfPresentLocked()).submissions.find(entry => entry.id === task.submissionNoticeId && entry.taskId === task.id)
+      if (submission === undefined) return undefined
+      const team = await this.readTeamLocked()
+      const purpose = task.route.type === 'review' ? 'review' as const : 'lead-acceptance' as const
+      const recipient = task.route.type === 'review' ? task.route.reviewer : resolveLeadMemberId(team)
+      const member = recipient === undefined ? undefined : memberById(team, recipient)
+      return { taskId, submissionId: submission.id, assignee: task.assignee ?? '', summary: submission.summary, purpose, recipient, sessionId: member?.sessionId, bindingGeneration: member?.bindingGeneration }
+    })
+  }
+
+  async isSubmissionNotificationCurrent(taskId: string, submissionId: string, recipient: string, purpose: string, sessionId?: string, bindingGeneration?: number): Promise<boolean> {
+    const current = await this.submissionNotificationSnapshot(taskId)
+    return current !== undefined && current.submissionId === submissionId && current.recipient === recipient && current.purpose === purpose && current.sessionId === sessionId && current.bindingGeneration === bindingGeneration
+  }
+
+  async processSubmissionNotification(taskId: string): Promise<SubmissionNotificationReceipt[]> {
+    const snapshot = await this.submissionNotificationSnapshot(taskId)
+    if (snapshot === undefined) return [{ purpose: 'lead-acceptance', state: 'superseded', reason: 'submission-no-longer-awaits-notification' }]
+    const { purpose, recipient, sessionId, bindingGeneration } = snapshot
+    if (recipient === undefined || sessionId === undefined || bindingGeneration === undefined || this.deliverSubmissionNotice === undefined) return [{ purpose, ...(recipient === undefined ? {} : { recipient }), state: 'unavailable', reason: recipient === undefined ? 'recipient-unavailable' : sessionId === undefined || bindingGeneration === undefined ? 'binding-unavailable' : 'notification-port-unavailable' }]
+    try {
+      const receipt = await this.deliverSubmissionNotice({ ...snapshot, recipient, sessionId, bindingGeneration, stillCurrent: async () => this.isSubmissionNotificationCurrent(taskId, snapshot.submissionId, recipient, purpose, sessionId, bindingGeneration) })
+      if (receipt.recipient !== recipient || receipt.purpose !== purpose || !['queued', 'pending', 'failed', 'unavailable', 'superseded'].includes(receipt.state) || receipt.state === 'queued' && (!receipt.messageId || !receipt.requestId)) return [{ recipient, purpose, state: 'failed', reason: 'invalid-notification-receipt' }]
+      return [receipt]
+    } catch {
+      const current = await this.isSubmissionNotificationCurrent(taskId, snapshot.submissionId, recipient, purpose, sessionId, bindingGeneration)
+      return [{ recipient, purpose, state: current ? 'failed' : 'superseded', reason: current ? 'notification-error' : 'submission-no-longer-current' }]
+    }
+  }
+
+  /** Recovery is opt-in per immutable submission, not a historical broadcast. */
+  async recoverSubmissionNotifications(limit = 8): Promise<void> {
+    if (this.deliverSubmissionNotice === undefined) return
+    const candidates = (await this.listTasks()).filter(task => submissionAwaitsDecision(task) && task.submissionNoticeId !== undefined && task.submissionNoticeId === task.latestSubmissionId)
+    const count = Math.min(candidates.length, Math.max(1, limit))
+    for (let i = 0; i < count; i++) await this.processSubmissionNotification(candidates[(this.submissionNoticeCursor + i) % candidates.length]!.id)
+    this.submissionNoticeCursor = candidates.length === 0 ? 0 : (this.submissionNoticeCursor + count) % candidates.length
+  }
+
+  /** Explicit Lead/human-authorized repair for one existing immutable submission. */
+  async requestSubmissionNotification(taskId: string, submissionId: string, actor: string): Promise<SubmissionNotificationReceipt[]> {
+    await withProcessLock(this.location.teamFile, async () => {
+      const team = await this.readTeamLocked()
+      if (!isLeadOrHuman(team, actor)) fail('only the lead or human may request a submission handoff')
+      const tasks = await this.readTasksIfPresentLocked()
+      const task = tasks.tasks.find(entry => entry.id === taskId)
+      if (!submissionAwaitsDecision(task, submissionId)) fail('submission no longer awaits a decision')
+      if (task.submissionNoticeId === submissionId) return
+      const next = { ...task, submissionNoticeId: submissionId, updatedAt: Date.now(), revision: task.revision + 1 }
+      await atomicWriteJson(this.location.file, { ...tasks, revision: tasks.revision + 1, tasks: tasks.tasks.map(entry => entry.id === taskId ? next : entry) })
+      await this.appendAudit({ kind: 'submission/notification-requested', taskId, submissionId, actor, at: Date.now() })
+    })
+    return this.processSubmissionNotification(taskId)
   }
 
   async acceptTask(request: AcceptTaskRequest): Promise<AcceptTaskResult> {
@@ -1188,7 +1491,7 @@ export class TaskStore {
       if (!isLeadOrHuman(team, request.actor)) fail(`only the lead may accept tasks; ask ${leadMemberIdForMessage(team)}`)
       if (task.status === 'completed') fail('task is already completed')
       if (task.archivedPath !== undefined) fail('task is already archived')
-      if (task.status !== 'waiting' && task.status !== 'needs_human') fail(`task cannot be accepted in status ${task.status}`)
+      if (task.awaitsDecision !== true) fail(task.latestSubmissionId === undefined ? `task ${task.id} has no submission to accept` : `task ${task.id} has no submission awaiting a decision; the last one was already decided`)
       const attempts = await this.readAttemptsIfPresentLocked()
       const activeAttempt = task.activeAttemptId === undefined ? undefined : attempts.attempts.find((entry) => entry.id === task.activeAttemptId && entry.status === 'active')
       if (activeAttempt === undefined) fail('task has no active attempt')
@@ -1209,9 +1512,9 @@ export class TaskStore {
       const document = await fs.readFile(sourcePath)
       if (await fileExists(archiveTarget)) fail('archive target already exists')
       const { integrationPending: _finished, ...settled } = currentTask
-      const nextTask: TeamTask = { ...settled, status: 'completed', ...(task.latestSubmissionId === undefined ? {} : { acceptedSubmissionId: task.latestSubmissionId }), archivedPath, contractRevision: (task.contractRevision ?? 0) + 1, updatedAt: now, revision: currentTask.revision + 1 }
+      const nextTask: TeamTask = withLifecycleIntent({ ...settled, awaitsDecision: false, status: 'completed', ...(task.latestSubmissionId === undefined ? {} : { acceptedSubmissionId: task.latestSubmissionId }), archivedPath, contractRevision: (task.contractRevision ?? 0) + 1, updatedAt: now, revision: currentTask.revision + 1 }, lifecycleIntent('acceptance', (task.contractRevision ?? 0) + 1, { submissionId: task.latestSubmissionId!, assignee: activeAttempt.memberId, ...(request.note === undefined ? {} : { text: request.note }) }))
       const nextAttempts: AttemptsState = { ...attempts, schemaVersion: CURRENT_SCHEMA_VERSION, revision: attempts.revision + 1, attempts: attempts.attempts.map((entry) => entry.id === activeAttempt.id ? { ...entry, status: 'completed' as const, revision: entry.revision + 1 } : entry) }
-      const nextTasks: TasksState = { ...tasks, schemaVersion: CURRENT_SCHEMA_VERSION, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === task.id ? nextTask : entry) }
+      const nextTasks: TasksState = { ...tasks, schemaVersion: TASKS_SCHEMA_VERSION, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === task.id ? nextTask : entry) }
       try {
         await atomicWrite(archiveTarget, document)
         await atomicWriteJson(this.location.attemptsFile, nextAttempts)
@@ -1229,10 +1532,85 @@ export class TaskStore {
       closing = { assignee: activeAttempt.memberId, taskId: task.id, ...(request.note === undefined ? {} : { note: request.note }) }
       return { task: clone(nextTask), archivedPath }
     })
-    if (closing !== undefined) {
-      try { await this.deliverClosing?.(closing) } catch { /* acceptance is durable; delivery is best-effort */ }
+    if (this.deliverLifecycleNotice === undefined && closing !== undefined) {
+      try { await this.deliverClosing?.(closing) } catch { /* legacy callback supplies no admission receipt */ }
     }
-    return result
+    return { ...result, notifications: await this.processLifecycleNotifications(request.taskId, 'acceptance') }
+  }
+
+  /**
+   * Close a task by hand, without a submission.
+   *
+   * The model always had a `cancelled` status and no way to reach it: accept needs a submission
+   * awaiting a decision, and a task whose work was done by hand, dropped, or overtaken has none. On a
+   * live stand a human closed three such tasks by editing their titles — the state never changed, and
+   * the panel offered only "Edit contract" and "Release attempt", neither of which closes anything.
+   */
+  async cancelTask(request: { taskId: string; actor: string; reason: string; expectedRevision?: number }): Promise<{ task: TeamTask; archivedPath?: string; quiesced: boolean; notifications?: SubmissionNotificationReceipt[] }> {
+    if (!candidateId(request.taskId) || request.actor.length === 0) fail('invalid cancel request')
+    if (typeof request.reason !== 'string' || request.reason.trim().length === 0) fail('a cancellation must say why')
+    const reason = request.reason.trim()
+    const initial = await withProcessLock(this.location.teamFile, async () => {
+      const tasks = await this.readTasksIfPresentLocked()
+      const task = tasks.tasks.find((entry) => entry.id === request.taskId)
+      if (task === undefined) fail(`task not found: ${request.taskId}`)
+      const team = await this.readTeamLocked()
+      if (!isLeadOrHuman(team, request.actor)) fail(`only the lead may close tasks; ask ${leadMemberIdForMessage(team)}`)
+      if (request.expectedRevision !== undefined && request.expectedRevision !== tasks.revision) {
+        throw new LiveTeamsError(ERROR_CODES.REVISION_CONFLICT, `expected revision ${request.expectedRevision}, actual ${tasks.revision}`)
+      }
+      if (task.status === 'completed') fail('task is already completed')
+      if (task.status === 'cancelled') fail('task is already cancelled')
+      if (task.archivedPath !== undefined) fail('task is already archived')
+      if (task.integrationPending !== undefined) fail('task has an unresolved integration; reconcile its Git outcome before cancelling')
+      const attempts = await this.readAttemptsIfPresentLocked()
+      const bound = attempts.attempts.find((entry) => entry.id === task.activeAttemptId)
+      if (task.activeAttemptId !== undefined && (bound === undefined || bound.taskId !== task.id || bound.memberId !== task.assignee)) fail('task attempt ownership is inconsistent; reconcile it before cancelling')
+      if (task.activeAttemptId === undefined && ['claimed', 'in_progress', 'waiting'].includes(task.status)) fail('task has no accountable attempt; reconcile its ownership before cancelling')
+      const live = bound?.status === 'active' || bound?.status === 'revoking' ? bound : undefined
+      return { task, live, revision: tasks.revision }
+    })
+    let settledTask = initial.task
+    if (initial.live !== undefined) {
+      // Reuse the durable capability fence and bounded stop protocol. Never archive a running writer.
+      const revoked = await this.revokeTask({ taskId: request.taskId, actor: request.actor, reason, expectedRevision: initial.revision })
+      if (!revoked.quiesced) return { task: revoked.task, quiesced: false }
+      settledTask = revoked.task
+    }
+    let cancellation: { assignee: string; taskId: string; reason: string } | undefined
+    const result = await withProcessLock(this.location.teamFile, async () => {
+      const tasks = await this.readTasksIfPresentLocked()
+      const task = tasks.tasks.find((entry) => entry.id === request.taskId)
+      if (task === undefined || task.revision !== settledTask.revision || task.activeAttemptId !== settledTask.activeAttemptId) {
+        throw new LiveTeamsError(ERROR_CODES.REVISION_CONFLICT, 'task changed while cancellation was stopping its Session; read it again')
+      }
+      const team = await this.readTeamLocked()
+      if (!isLeadOrHuman(team, request.actor)) fail(`only the lead may close tasks; ask ${leadMemberIdForMessage(team)}`)
+      if (task.integrationPending !== undefined) fail('task has an unresolved integration; reconcile its Git outcome before cancelling')
+      const now = Date.now()
+      // Preserve authored bytes, including content not represented in the structured contract.
+      let document: string
+      try { document = await fs.readFile(this.documentPath(task.id), 'utf8') } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        fail('task document is missing; restore the authored document before cancelling')
+      }
+      const archivedPath = path.join('archive', `${now}-${task.id}.md`)
+      const archiveTarget = path.join(this.location.directory, archivedPath)
+      if (await fileExists(archiveTarget)) fail('archive target already exists')
+      const closed: TeamTask = { ...task, awaitsDecision: false, status: 'cancelled', archivedPath, contractRevision: (task.contractRevision ?? 0) + 1, updatedAt: now, revision: task.revision + 1 }
+      const nextTask = task.assignee === undefined ? closed : withLifecycleIntent(closed, lifecycleIntent('cancellation', closed.contractRevision ?? 0, { assignee: task.assignee, text: reason }))
+      delete nextTask.activeAttemptId
+      const nextTasks: TasksState = { ...tasks, schemaVersion: TASKS_SCHEMA_VERSION, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === task.id ? nextTask : entry) }
+      await atomicWrite(archiveTarget, `${document}\n\n## Cancellation\n\nActor: ${request.actor}\n\nReason: ${reason}\n`)
+      await atomicWriteJson(this.location.file, nextTasks)
+      await this.appendAudit({ kind: 'task/cancelled', taskId: task.id, reason, actor: request.actor, at: now, revision: nextTasks.revision })
+      if (task.assignee !== undefined) cancellation = { assignee: task.assignee, taskId: task.id, reason }
+      return { task: clone(nextTask), archivedPath, quiesced: true }
+    })
+    if (this.deliverLifecycleNotice === undefined && cancellation !== undefined) {
+      try { await this.deliverCancellation?.(cancellation) } catch { /* legacy callback supplies no admission receipt */ }
+    }
+    return { ...result, notifications: await this.processLifecycleNotifications(request.taskId, 'cancellation') }
   }
 
   async reviseTask(request: ReviseTaskRequest): Promise<ReviseTaskResult> {
@@ -1252,22 +1630,26 @@ export class TaskStore {
       const activeAttempt = task.activeAttemptId === undefined ? undefined : attempts.attempts.find((entry) => entry.id === task.activeAttemptId && entry.status === 'active')
       if (activeAttempt === undefined || activeAttempt.memberId !== task.assignee) fail('task has no active attempt')
       const now = Date.now()
-      const nextTask: TeamTask = { ...task, status: 'in_progress', contractRevision: (task.contractRevision ?? 0) + 1, updatedAt: now, revision: task.revision + 1 }
-      const nextTasks: TasksState = { ...tasks, schemaVersion: CURRENT_SCHEMA_VERSION, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === task.id ? nextTask : entry) }
+      // The return takes the decision away: the member owes a new submission, so nothing is waiting
+      // for the lead or the human until it arrives.
+      if (task.integrationPending !== undefined) fail('task has an unresolved integration; reconcile its Git outcome before revising')
+      const nextTask: TeamTask = withLifecycleIntent({ ...task, status: 'in_progress', awaitsDecision: false, ...(task.reviewReturn === undefined ? {} : { reviewReturn: { ...task.reviewReturn, state: 'superseded', reason: 'manual-return', leadNotified: false } }), contractRevision: (task.contractRevision ?? 0) + 1, updatedAt: now, revision: task.revision + 1 }, lifecycleIntent('direction', (task.contractRevision ?? 0) + 1, { assignee: task.assignee, attemptId: activeAttempt.id, text: instructions }))
+      const nextTasks: TasksState = { ...tasks, schemaVersion: TASKS_SCHEMA_VERSION, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === task.id ? nextTask : entry) }
       await atomicWriteJson(this.location.file, nextTasks)
       await this.appendAudit({ kind: 'task/revised', taskId: task.id, actor: request.actor, instructions, at: now, revision: nextTasks.revision })
       direction = { assignee: task.assignee, taskId: task.id, instructions }
       return { task: clone(nextTask) }
     })
-    if (direction !== undefined) {
-      try { await this.deliverDirection?.(direction) } catch { /* state transition remains durable */ }
+    if (this.deliverLifecycleNotice === undefined && direction !== undefined) {
+      try { await this.deliverDirection?.(direction) } catch { /* legacy callback supplies no admission receipt */ }
     }
-    return result
+    return { ...result, notifications: await this.processLifecycleNotifications(request.taskId, 'direction') }
   }
 
   async reviewTask(request: ReviewTaskRequest): Promise<ReviewTaskResult> {
     if (!candidateId(request.taskId) || !candidateId(request.submissionId) || request.reviewerMemberId.length === 0 || !REVIEW_VERDICTS.includes(request.verdict)) fail('invalid review request')
     let escalation: Parameters<NonNullable<TaskStoreOptions['deliverEscalation']>>[0] | undefined
+    const audit: unknown[] = []
     const result = await withProcessLock(this.location.teamFile, async () => {
       const tasks = await this.readTasksIfPresentLocked()
       const task = tasks.tasks.find((entry) => entry.id === request.taskId)
@@ -1306,7 +1688,12 @@ export class TaskStore {
       // write is the one that drops the marker.
       const reviewedTask = request.verdict === 'pass' ? await this.integrateSubmission(submission, task) : task
       const { integrationPending: _pendingDrop, ...reviewedSettled } = reviewedTask
-      let nextTask: TeamTask = { ...reviewedSettled, updatedAt: now, revision: reviewedTask.revision + 1 }
+      let nextTask: TeamTask = { ...(request.verdict === 'pass' ? reviewedSettled : reviewedTask), awaitsDecision: false, updatedAt: now, revision: reviewedTask.revision + 1 }
+      if (request.verdict === 'needs_revision') {
+        const intent: ReviewReturn = { roundId: round.id, submissionId: submission.id, attemptId: authoring.id, generation: authoring.generation, assignee: authoring.memberId, sessionId: authoring.sessionId, bindingGeneration: authoring.bindingGeneration, state: 'pending', at: now }
+        const reason = await this.reviewReturnBlockLocked(nextTask, intent, tasks.tasks, attempts.attempts)
+        nextTask = { ...nextTask, status: reason === undefined ? 'in_progress' : 'waiting', reviewReturn: { ...intent, ...(reason === undefined ? {} : { state: 'blocked' as const, reason }) } }
+      }
       // A reviewer's PASS accepts the work, so it restates the contract exactly like the
       // human's acceptance does. Without this bump a human intervention recorded earlier
       // stayed unresolved on a finished task — and every task depending on it stayed
@@ -1314,6 +1701,7 @@ export class TaskStore {
       // (found while scripting the B31 run; F17).
       if (request.verdict === 'pass') nextTask = { ...nextTask, acceptedSubmissionId: submission.id, status: 'completed', contractRevision: (task.contractRevision ?? 0) + 1 }
       else if (request.verdict === 'escalate') nextTask = { ...nextTask, status: 'waiting' }
+      if (request.verdict === 'pass' || request.verdict === 'escalate') nextTask = withLifecycleIntent(nextTask, lifecycleIntent('review-verdict', nextTask.contractRevision ?? 0, { roundId: round.id, submissionId: submission.id }))
       // A reviewer's PASS completes the task, so the attempt that produced it ends here.
       // Leaving it active made the member look permanently busy to the dispatcher (the
       // first live run found exactly that) and kept the intervention observer watching a
@@ -1342,21 +1730,211 @@ export class TaskStore {
       }
       if (archivedPath !== undefined) {
         await fs.unlink(this.documentPath(task.id)).catch(() => undefined)
-        await this.appendAudit({ kind: 'task/archived', taskId: task.id, actor: request.reviewerMemberId, archivedPath, at: now, revision: tasks.revision + 1 })
+        audit.push({ kind: 'task/archived', taskId: task.id, actor: request.reviewerMemberId, archivedPath, at: now, revision: tasks.revision + 1 })
       }
-      await this.appendAudit({ kind: 'review/round', taskId: task.id, submissionId: submission.id, reviewerMemberId: request.reviewerMemberId, verdict: request.verdict, round: round.round, at: now, revision: nextReviews.revision })
-      if (request.verdict === 'pass') await this.appendAudit({ kind: 'task/accepted', taskId: task.id, submissionId: submission.id, actor: request.reviewerMemberId, at: now, revision: tasks.revision + 1 })
+      audit.push({ kind: 'review/round', taskId: task.id, submissionId: submission.id, reviewerMemberId: request.reviewerMemberId, verdict: request.verdict, round: round.round, at: now, revision: nextReviews.revision })
+      if (request.verdict === 'pass') audit.push({ kind: 'task/accepted', taskId: task.id, submissionId: submission.id, actor: request.reviewerMemberId, at: now, revision: tasks.revision + 1 })
       if (request.verdict === 'escalate') {
         const leadMemberId = leadMemberIdForMessage(await this.readTeamLocked())
         const problem = findings.map((finding) => finding.problem).join('; ') || 'reviewer escalated without a finding'
         const tried = findings.map((finding) => finding.requiredFix).join('; ') || 'review evidence recorded'
-        await this.appendAudit({ kind: 'review/escalated', taskId: task.id, submissionId: submission.id, reviewerMemberId: request.reviewerMemberId, leadMemberId, problem, tried, at: now, revision: nextReviews.revision })
+        audit.push({ kind: 'review/escalated', taskId: task.id, submissionId: submission.id, reviewerMemberId: request.reviewerMemberId, leadMemberId, problem, tried, at: now, revision: nextReviews.revision })
         escalation = { leadMemberId, taskId: task.id, submissionId: submission.id, round, reviewerMemberId: request.reviewerMemberId, problem, tried }
       }
       return { round: clone(round), task: clone(nextTask) }
     })
-    if (escalation !== undefined) await this.deliverEscalation?.(escalation)
-    return result
+    for (const event of audit) await this.appendAudit(event)
+    if (this.deliverLifecycleNotice === undefined && escalation !== undefined) {
+      try { await this.deliverEscalation?.(escalation) } catch { /* verdict is saved; legacy callback supplies no admission receipt */ }
+    }
+    if (request.verdict === 'needs_revision') {
+      await this.processReviewReturn(request.taskId)
+      return { ...result, task: (await this.readTask(request.taskId)).task, notifications: await this.reviewReturnNotifications(request.taskId) }
+    }
+    return { ...result, notifications: await this.processLifecycleNotifications(request.taskId, 'review-verdict') }
+  }
+
+  async isReviewReturnLeadCurrent(taskId: string, roundId: string, recipient: string, noticeClass: string | undefined, sessionId?: string, bindingGeneration?: number): Promise<boolean> {
+    return withProcessLock(this.location.teamFile, async () => {
+      if (noticeClass === undefined || sessionId === undefined || bindingGeneration === undefined || await fileExists(path.join(this.location.directory, 'disabled'))) return false
+      const task = (await this.readTasksIfPresentLocked()).tasks.find(entry => entry.id === taskId)
+      const intent = task?.reviewReturn
+      const team = await this.readTeamLocked()
+      const member = memberById(team, recipient)
+      return task !== undefined && task.archivedPath === undefined && ['in_progress', 'waiting', 'needs_human'].includes(task.status) && intent !== undefined && intent.roundId === roundId && task.latestSubmissionId === intent.submissionId && reviewReturnNoticeClass(intent) === noticeClass && resolveLeadMemberId(team) === recipient && member?.sessionId === sessionId && member.bindingGeneration === bindingGeneration
+    })
+  }
+
+  private async reviewReturnNotifications(taskId: string): Promise<SubmissionNotificationReceipt[]> {
+    return withProcessLock(this.location.teamFile, async () => {
+      const intent = (await this.readTasksIfPresentLocked()).tasks.find(task => task.id === taskId)?.reviewReturn
+      if (intent === undefined) return []
+      const team = await this.readTeamLocked()
+      const lead = resolveLeadMemberId(team)
+      const leadMember = lead === undefined ? undefined : memberById(team, lead)
+      const ids = intent.messageId === undefined ? {} : { messageId: intent.messageId, requestId: intent.requestId! }
+      const knownAdmitted = intent.admission === 'queued' || ['delivered', 'started', 'completed'].includes(intent.state)
+      const author: SubmissionNotificationReceipt = { recipient: intent.assignee, purpose: 'review-return', ...ids, state: knownAdmitted ? 'queued' : intent.state === 'failed' ? 'failed' : ['blocked', 'superseded'].includes(intent.state) ? 'superseded' : intent.requestId === undefined && intent.state === 'unconfirmed' ? 'unavailable' : 'pending', ...(intent.reason === undefined ? {} : { reason: intent.reason }) }
+      const receipt = intent.leadNotification
+      const leadReceipt: SubmissionNotificationReceipt = receipt !== undefined && receipt.recipient === lead && (receipt.state !== 'queued' || receipt.sessionId !== undefined && receipt.sessionId === leadMember?.sessionId && receipt.bindingGeneration === leadMember?.bindingGeneration) && (receipt.state !== 'queued' || intent.leadNotified === true) && reviewReturnNoticeClass(intent) !== undefined ? receipt : { ...(lead === undefined ? {} : { recipient: lead }), purpose: 'review-return-lead', state: lead === undefined || intent.leadNotified === true ? 'unavailable' : 'pending', reason: lead === undefined ? 'recipient-unavailable' : intent.leadNotified === true ? 'legacy-notification-no-admission-receipt' : 'awaiting-semantic-lead-notification' }
+      return [author, leadReceipt]
+    })
+  }
+
+  private async reviewReturnBlockLocked(task: TeamTask, intent: ReviewReturn, tasks: TeamTask[], attempts: TaskAttempt[]): Promise<string | undefined> {
+    if (task.archivedPath !== undefined || !['in_progress', 'claimed', 'waiting'].includes(task.status)) return 'task-not-active'
+    if (task.latestSubmissionId !== intent.submissionId) return 'submission-changed'
+    const attempt = attempts.find(entry => entry.id === intent.attemptId)
+    if (task.activeAttemptId !== intent.attemptId || attempt?.status !== 'active' || attempt.generation !== intent.generation || attempt.memberId !== intent.assignee) return 'attempt-changed'
+    if (attempt.humanIntervenedAt !== undefined && (attempt.humanIntervenedContractRevision === undefined || (task.contractRevision ?? 0) <= attempt.humanIntervenedContractRevision)) return 'human-intervened'
+    if (task.integrationPending !== undefined) return 'integration-pending'
+    const team = await this.readTeamLocked()
+    if (team.dispatch?.mode === 'paused') return 'dispatch-paused'
+    if (await fileExists(path.join(this.location.directory, 'disabled'))) return 'team-disabled'
+    const member = team.members.find(entry => entry.memberId === intent.assignee)
+    if (member === undefined || member.sessionId !== intent.sessionId || member.bindingGeneration !== intent.bindingGeneration || attempt.sessionId !== intent.sessionId || attempt.bindingGeneration !== intent.bindingGeneration) return 'binding-changed'
+    if (member.availability !== 'available') return 'member-unavailable'
+    if ((task.dependsOn ?? []).some(id => tasks.find(entry => entry.id === id)?.status !== 'completed')) return 'dependency-not-completed'
+    if (attempts.some(entry => entry.id !== attempt.id && entry.status === 'active' && entry.memberId === intent.assignee)) return 'member-busy'
+    if (CODING_KINDS.has(task.kind) && attempts.some(other => other.id !== attempt.id && other.status === 'active' && (tasks.find(entry => entry.id === other.taskId)?.paths ?? []).some(otherPath => (task.paths ?? []).some(ownPath => scopesIntersect(literalPrefix(otherPath), literalPrefix(ownPath)))))) return 'paths-overlap'
+    return undefined
+  }
+
+  async isReviewReturnCurrent(taskId: string, identity: Pick<ReviewReturn, 'roundId' | 'submissionId' | 'attemptId' | 'generation' | 'assignee' | 'sessionId' | 'bindingGeneration'>): Promise<boolean> {
+    return withProcessLock(this.location.teamFile, async () => {
+      const tasks = await this.readTasksIfPresentLocked()
+      const task = tasks.tasks.find(entry => entry.id === taskId)
+      const intent = task?.reviewReturn
+      if (task === undefined || intent === undefined || ['blocked', 'failed', 'superseded'].includes(intent.state)) return false
+      if ((['roundId', 'submissionId', 'attemptId', 'generation', 'assignee', 'sessionId', 'bindingGeneration'] as const).some(key => identity[key] !== intent[key])) return false
+      return await this.reviewReturnBlockLocked(task, intent, tasks.tasks, (await this.readAttemptsIfPresentLocked()).attempts) === undefined
+    })
+  }
+
+  async blockReviewReturn(taskId: string, identity: Pick<ReviewReturn, 'roundId' | 'submissionId' | 'attemptId' | 'generation' | 'assignee' | 'sessionId' | 'bindingGeneration'>, reason: 'human-intervened' | 'intervention-unobservable'): Promise<void> {
+    const blocked = await withProcessLock(this.location.teamFile, async () => {
+      const tasks = await this.readTasksIfPresentLocked()
+      const task = tasks.tasks.find(entry => entry.id === taskId)
+      const intent = task?.reviewReturn
+      if (task === undefined || intent === undefined || !['pending', 'sending', 'delivered', 'unconfirmed'].includes(intent.state) || (['roundId', 'submissionId', 'attemptId', 'generation', 'assignee', 'sessionId', 'bindingGeneration'] as const).some(key => intent[key] !== identity[key])) return undefined
+      if (await this.reviewReturnBlockLocked(task, intent, tasks.tasks, (await this.readAttemptsIfPresentLocked()).attempts) !== undefined) return undefined
+      const nextIntent: ReviewReturn = { ...intent, state: 'blocked', reason, leadNotified: false }
+      const next: TeamTask = { ...task, status: 'waiting', reviewReturn: nextIntent, updatedAt: Date.now(), revision: task.revision + 1 }
+      await atomicWriteJson(this.location.file, { ...tasks, revision: tasks.revision + 1, tasks: tasks.tasks.map(entry => entry.id === taskId ? next : entry) })
+      return nextIntent
+    })
+    if (blocked !== undefined) await this.appendAudit({ kind: 'review/returned', taskId, roundId: blocked.roundId, attemptId: blocked.attemptId, state: blocked.state, reason, at: Date.now(), actor: 'scheduler' })
+  }
+
+  async recoverReviewReturns(limit = 8): Promise<void> {
+    const candidates = await withProcessLock(this.location.teamFile, async () => {
+      const team = await this.readTeamLocked()
+      const leadId = resolveLeadMemberId(team)
+      const lead = leadId === undefined ? undefined : memberById(team, leadId)
+      return (await this.readTasksIfPresentLocked()).tasks.filter(task => {
+        const intent = task.reviewReturn
+        if (intent === undefined || task.archivedPath !== undefined || !['in_progress', 'waiting', 'needs_human'].includes(task.status)) return false
+        const prior = intent.leadNotification
+        const changed = prior?.sessionId !== undefined && (prior.recipient !== leadId || prior.sessionId !== lead?.sessionId || prior.bindingGeneration !== lead?.bindingGeneration)
+        return ['pending', 'sending', 'delivered', 'unconfirmed'].includes(intent.state) || reviewReturnNoticeClass(intent) !== undefined && (!intent.leadNotified || changed)
+      })
+    })
+    const count = Math.min(candidates.length, Math.max(1, limit))
+    for (let i = 0; i < count; i++) await this.processReviewReturn(candidates[(this.reviewReturnCursor + i) % candidates.length]!.id)
+    this.reviewReturnCursor = candidates.length === 0 ? 0 : (this.reviewReturnCursor + count) % candidates.length
+  }
+
+  /** Recover only explicit prospective intents, never old terminal review records. */
+  async processReviewReturn(taskId: string): Promise<void> {
+    const existing = this.reviewReturnRuns.get(taskId)
+    if (existing !== undefined) return existing
+    const operation = this.runReviewReturn(taskId)
+    this.reviewReturnRuns.set(taskId, operation)
+    try { await operation } finally { if (this.reviewReturnRuns.get(taskId) === operation) this.reviewReturnRuns.delete(taskId) }
+  }
+
+  private async runReviewReturn(taskId: string): Promise<void> {
+    const snapshot = await withProcessLock(this.location.teamFile, async () => {
+      const tasks = await this.readTasksIfPresentLocked()
+      const task = tasks.tasks.find(entry => entry.id === taskId)
+      const intent = task?.reviewReturn
+      if (task === undefined || intent === undefined || task.archivedPath !== undefined || !['in_progress', 'waiting', 'needs_human'].includes(task.status)) return undefined
+      const round = (await this.readReviewsIfPresentLocked()).rounds.find(entry => entry.id === intent.roundId && entry.submissionId === intent.submissionId && entry.verdict === 'needs_revision')
+      if (round === undefined) return undefined
+      const team = await this.readTeamLocked()
+      const leadMemberId = leadMemberIdForMessage(team)
+      const lead = memberById(team, leadMemberId)
+      return { taskId, title: task.title, leadMemberId, ...(lead?.sessionId === undefined ? {} : { leadSessionId: lead.sessionId, leadBindingGeneration: lead.bindingGeneration }), intent: clone(intent), round: clone(round) }
+    })
+    if (snapshot === undefined) return
+    const update = async (patch: Partial<Omit<ReviewReturn, 'reason'>> & { reason?: string | undefined }): Promise<ReviewReturn | undefined> => {
+      const outcome = await withProcessLock(this.location.teamFile, async () => {
+        const tasks = await this.readTasksIfPresentLocked()
+        const task = tasks.tasks.find(entry => entry.id === taskId)
+        if (task?.reviewReturn?.roundId !== snapshot.intent.roundId) return undefined
+        if (patch.leadNotified === true && (task.reviewReturn.state !== snapshot.intent.state || task.reviewReturn.reason !== snapshot.intent.reason)) return undefined
+        if (['superseded', 'blocked'].includes(task.reviewReturn.state) && patch.state !== undefined && patch.state !== task.reviewReturn.state) return undefined
+        const block = patch.leadNotified === true ? undefined : await this.reviewReturnBlockLocked(task, snapshot.intent, tasks.tasks, (await this.readAttemptsIfPresentLocked()).attempts)
+        const { reason, ...merged } = { ...task.reviewReturn, ...patch }
+        const intent: ReviewReturn = { ...merged, ...(reason === undefined ? {} : { reason }), ...(block !== undefined && !['blocked', 'superseded'].includes(patch.state ?? task.reviewReturn.state) ? { state: 'superseded' as const, reason: block } : {}) }
+        if (JSON.stringify(intent) === JSON.stringify(task.reviewReturn)) return undefined
+        if (reviewReturnNoticeClass(intent) !== reviewReturnNoticeClass(task.reviewReturn)) { intent.leadNotified = false; delete intent.leadNotification }
+        parseReviewReturn(intent)
+        const next: TeamTask = { ...task, ...(intent.state === 'failed' && task.status === 'in_progress' ? { status: 'needs_human' } : {}), reviewReturn: intent, updatedAt: Date.now(), revision: task.revision + 1 }
+        await atomicWriteJson(this.location.file, { ...tasks, revision: tasks.revision + 1, tasks: tasks.tasks.map(entry => entry.id === taskId ? next : entry) })
+        return intent
+      })
+      if (outcome !== undefined) {
+        snapshot.intent = outcome
+        await this.appendAudit({ kind: patch.leadNotified === true ? 'review/lead-notified' : 'review/returned', taskId, roundId: outcome.roundId, attemptId: outcome.attemptId, submissionId: outcome.submissionId, ...(outcome.requestId === undefined ? {} : { requestId: outcome.requestId }), ...(outcome.turn === undefined ? {} : { turn: outcome.turn }), ...(outcome.inputSeq === undefined ? {} : { inputSeq: outcome.inputSeq }), state: outcome.state, ...(outcome.reason === undefined ? {} : { reason: outcome.reason }), at: Date.now(), actor: 'scheduler' })
+      }
+      return outcome
+    }
+    const stillCurrent = async (): Promise<boolean> => this.isReviewReturnCurrent(taskId, snapshot.intent)
+    const refresh = async (): Promise<boolean> => withProcessLock(this.location.teamFile, async () => {
+      const current = (await this.readTasksIfPresentLocked()).tasks.find(entry => entry.id === taskId)?.reviewReturn
+      if (current?.roundId !== snapshot.intent.roundId) return false
+      snapshot.intent = clone(current)
+      return true
+    })
+    const request: ReviewReturnRequest = { ...snapshot, stillCurrent, leadStillCurrent: async () => this.isReviewReturnLeadCurrent(taskId, snapshot.intent.roundId, snapshot.leadMemberId, reviewReturnNoticeClass(snapshot.intent), snapshot.leadSessionId, snapshot.leadBindingGeneration) }
+    if (['pending', 'sending', 'delivered', 'unconfirmed'].includes(snapshot.intent.state) && !await stillCurrent()) await update({ state: 'superseded', reason: 'capability-changed' })
+    if (['pending', 'sending'].includes(snapshot.intent.state)) {
+      if (!await stillCurrent()) await update({ state: 'superseded', reason: 'capability-changed' })
+      else if (this.deliverReviewReturn === undefined) await update({ state: 'unconfirmed', reason: 'delivery-unavailable' })
+      else {
+        await update({ state: 'sending' })
+        request.intent = snapshot.intent
+        if (snapshot.intent.state === 'sending' && await stillCurrent()) {
+          try {
+            const receipt = await this.deliverReviewReturn(request)
+            await update({ messageId: receipt.messageId, requestId: receipt.requestId, admission: receipt.pending ? 'pending' : 'queued', state: receipt.pending ? 'sending' : 'delivered', reason: receipt.pending ? 'delivery-pending' : undefined })
+          } catch { await update({ state: 'failed', reason: 'delivery-failed' }) }
+        }
+      }
+    }
+    if (!await refresh()) return
+    if (['sending', 'delivered', 'unconfirmed'].includes(snapshot.intent.state) && snapshot.intent.requestId !== undefined && await stillCurrent()) {
+      request.intent = snapshot.intent
+      try {
+        let receipt = await this.observeReviewReturn?.(request)
+        if (receipt !== undefined && ['started', 'completed'].includes(receipt.state) && (!Number.isSafeInteger(receipt.turn) || Number(receipt.turn) < 0 || !Number.isSafeInteger(receipt.inputSeq) || Number(receipt.inputSeq) < 0)) receipt = { state: 'unobservable', reason: 'invalid-execution-receipt' }
+        const awaitingDelivery = snapshot.intent.state === 'sending'
+        await update({ state: receipt?.state === 'started' || receipt?.state === 'completed' || receipt?.state === 'failed' ? receipt.state : awaitingDelivery ? 'sending' : 'unconfirmed', ...(receipt?.turn === undefined ? {} : { turn: receipt.turn }), ...(receipt?.inputSeq === undefined ? {} : { inputSeq: receipt.inputSeq }), reason: receipt?.reason ?? (awaitingDelivery && (receipt === undefined || receipt.state === 'pending' || receipt.state === 'unobservable') ? 'delivery-pending' : receipt?.state === 'pending' ? 'execution-not-yet-observed' : receipt?.state === 'unobservable' || receipt === undefined ? 'execution-unobservable' : undefined) })
+      } catch { await update({ state: 'unconfirmed', reason: 'observation-failed' }) }
+    }
+    if (!await refresh()) return
+    const previousLead = snapshot.intent.leadNotification
+    if (previousLead !== undefined && previousLead.sessionId !== undefined && (previousLead.recipient !== snapshot.leadMemberId || previousLead.sessionId !== snapshot.leadSessionId || previousLead.bindingGeneration !== snapshot.leadBindingGeneration)) await update({ leadNotified: false })
+    if (reviewReturnNoticeClass(snapshot.intent) !== undefined && !snapshot.intent.leadNotified && this.notifyReviewReturn !== undefined) {
+      request.intent = snapshot.intent
+      try {
+        const receipt = await this.notifyReviewReturn(request)
+        if (receipt === undefined) await update({ leadNotified: true }) // Legacy callback has no structured admission proof.
+        else if (receipt.purpose === 'review-return-lead' && receipt.recipient === snapshot.leadMemberId) await update({ leadNotified: receipt.state === 'queued', leadNotification: receipt })
+        else await update({ leadNotified: false, leadNotification: { recipient: snapshot.leadMemberId, purpose: 'review-return-lead', state: 'failed', reason: 'invalid-notification-receipt' } })
+      } catch { await update({ leadNotified: false, leadNotification: { recipient: snapshot.leadMemberId, purpose: 'review-return-lead', state: 'failed', reason: 'notification-error' } }) }
+    }
   }
 
   /**
@@ -1525,30 +2103,38 @@ export class TaskStore {
   async migrate(): Promise<{ files: { file: string; from: number; to: number; backup: string }[] }> {
     const migrations = this.migrations
     const files: { file: string; from: number; to: number; backup: string }[] = []
-    const targets: { file: string; what: string; stamp: (state: Record<string, unknown>) => Record<string, unknown> }[] = [
-      { file: this.location.file, what: 'task state', stamp: (state) => ({ ...state, schemaVersion: CURRENT_SCHEMA_VERSION }) },
-      { file: this.location.attemptsFile, what: 'attempts state', stamp: (state) => ({ ...state, schemaVersion: CURRENT_SCHEMA_VERSION }) },
-      { file: this.location.submissionsFile, what: 'submissions state', stamp: (state) => ({ ...state, schemaVersion: CURRENT_SCHEMA_VERSION }) },
-      { file: this.location.reviewsFile, what: 'reviews state', stamp: (state) => ({ ...state, schemaVersion: CURRENT_SCHEMA_VERSION }) },
+    const targets: { file: string; what: string; version: number; stamp: (state: Record<string, unknown>) => Record<string, unknown> }[] = [
+      { file: this.location.file, what: 'task state', version: TASKS_SCHEMA_VERSION, stamp: (state) => ({ ...state, schemaVersion: TASKS_SCHEMA_VERSION }) },
+      { file: this.location.attemptsFile, what: 'attempts state', version: CURRENT_SCHEMA_VERSION, stamp: (state) => ({ ...state, schemaVersion: CURRENT_SCHEMA_VERSION }) },
+      { file: this.location.submissionsFile, what: 'submissions state', version: CURRENT_SCHEMA_VERSION, stamp: (state) => ({ ...state, schemaVersion: CURRENT_SCHEMA_VERSION }) },
+      { file: this.location.reviewsFile, what: 'reviews state', version: CURRENT_SCHEMA_VERSION, stamp: (state) => ({ ...state, schemaVersion: CURRENT_SCHEMA_VERSION }) },
     ]
-    return await withProcessLock(this.location.teamFile, async () => {
-      for (const target of targets) {
-        let raw: unknown
-        try { raw = JSON.parse(await fs.readFile(target.file, 'utf8')) } catch { continue }
-        const state = objectRecord(raw)
-        if (state === undefined) continue
-        const plan = planMigration(state.schemaVersion, CURRENT_SCHEMA_VERSION, target.what, migrations)
-        if (plan.kind === 'future') throw plan.error
-        if (plan.kind === 'current') continue
-        const backup = `${target.file}.v${plan.from}.bak`
-        await fs.copyFile(target.file, backup)
-        const migrated = target.stamp(objectRecord(applyMigration(state, plan, migrations)) ?? state)
-        await atomicWriteJson(target.file, migrated)
-        await this.appendAudit({ kind: 'state/migrated', file: path.basename(target.file), from: plan.from, to: plan.to, backup: path.basename(backup), actor: 'reconciler', at: Date.now() })
-        files.push({ file: path.basename(target.file), from: plan.from, to: plan.to, backup: path.basename(backup) })
+    try {
+      return await withProcessLock(this.location.teamFile, async () => {
+        for (const target of targets) {
+          let raw: unknown
+          try { raw = JSON.parse(await fs.readFile(target.file, 'utf8')) } catch { continue }
+          const state = objectRecord(raw)
+          if (state === undefined) continue
+          const plan = planMigration(state.schemaVersion, target.version, target.what, migrations)
+          if (plan.kind === 'future') throw plan.error
+          if (plan.kind === 'current') continue
+          const backup = `${target.file}.v${plan.from}.bak`
+          await fs.copyFile(target.file, backup)
+          const migrated = target.stamp(objectRecord(applyMigration(state, plan, migrations)) ?? state)
+          await atomicWriteJson(target.file, migrated)
+          files.push({ file: path.basename(target.file), from: plan.from, to: plan.to, backup: path.basename(backup) })
+        }
+        return { files }
+      })
+    } finally {
+      // The audit port may lazily open TeamStore, which takes this same lock.
+      // Await it only after releasing the lock, including when a later file
+      // fails migration: earlier durable writes still need their audit events.
+      for (const file of files) {
+        await this.appendAudit({ kind: 'state/migrated', ...file, actor: 'reconciler', at: Date.now() })
       }
-      return { files }
-    })
+    }
   }
 
   /** B32: resolved once per store; the answer cannot change while a store lives. */
@@ -1606,6 +2192,12 @@ export class TaskStore {
       if (this.changedPaths === undefined) return { declared, state: 'unchecked', reason: 'unreadable', mode }
       try { changed = await this.changedPaths(this.workspacePath) } catch { changed = undefined }
       if (changed === undefined) return { declared, state: 'unchecked', reason: 'unreadable', mode }
+      // A member that commits its work still wrote those paths. Without this the union is the working
+      // tree alone, and a clean tree reads as "nothing changed" (found on a real stand).
+      if (this.committedPaths !== undefined && attempt.gitBase !== undefined) {
+        const committed = await this.committedPaths(this.workspacePath, attempt.gitBase.baseTipSha).catch(() => undefined)
+        if (committed !== undefined) changed = [...changed, ...committed]
+      }
     } else {
       // `files` mode: the changed set is the difference between the fingerprint taken when
       // the attempt claimed the task and the tree as it is now. A missing snapshot is
@@ -1728,12 +2320,16 @@ export class TaskStore {
         .filter((field) => comparable(field, task[field]) !== comparable(field, (normalized as Record<string, unknown>)[field]))
       // A no-op would bump the revision and write an audit record that says nothing.
       if (changed.length === 0) fail('nothing to change; the contract already matches')
+      const attempts = await this.readAttemptsIfPresentLocked()
+      // Fixing the contract of previously started, parked work is not an explicit restart.
+      // Fresh drafts retain B27's normal readiness calculation; historical work needs resumeTask.
+      const parked = task.status === 'draft' && attempts.attempts.some((entry) => entry.taskId === task.id)
       const now = Date.now()
       const nextTask: TeamTask = {
         ...task,
         title: normalized.title,
         kind: normalized.kind,
-        status: normalized.status,
+        status: parked ? 'draft' : normalized.status,
         acceptance: normalized.acceptance,
         roundLimit: normalized.roundLimit,
         humanContact: normalized.humanContact,
@@ -1756,7 +2352,7 @@ export class TaskStore {
         if (value === undefined) delete nextTask[field]
         else Object.assign(nextTask, { [field]: value })
       }
-      const nextTasks: TasksState = { ...tasks, schemaVersion: CURRENT_SCHEMA_VERSION, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === task.id ? nextTask : entry) }
+      const nextTasks: TasksState = { ...tasks, schemaVersion: TASKS_SCHEMA_VERSION, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === task.id ? nextTask : entry) }
       // The document is the contract a member reads, so it is re-rendered from the
       // record — never left showing the previous version.
       const document = renderDocument(nextTask, team, { tasks: tasks.tasks })
@@ -1768,7 +2364,8 @@ export class TaskStore {
         throw error
       }
       await this.appendAudit({ kind: 'task/updated', taskId: task.id, actor: request.actor, fields: changed, at: now, revision: nextTasks.revision })
-      return { task: clone(nextTask), document, changed }
+      const warnings = await diagnosePaths(this.workspacePath, nextTask.paths)
+      return { task: clone(nextTask), document, changed, ...(warnings.length === 0 ? {} : { warnings }) }
     })
   }
 
@@ -1850,7 +2447,8 @@ export class TaskStore {
       if (request.expectedRevision !== undefined && request.expectedRevision !== tasks.revision) {
         throw new LiveTeamsError(ERROR_CODES.REVISION_CONFLICT, `expected revision ${request.expectedRevision}, actual ${tasks.revision}`)
       }
-      if (task.status !== 'claimed' && task.status !== 'in_progress') fail(`task cannot be revoked in status ${task.status}`)
+      if (!['claimed', 'in_progress', 'waiting', 'needs_human'].includes(task.status)) fail(`task cannot be revoked in status ${task.status}`)
+      if (task.integrationPending !== undefined) fail('task has an unresolved integration; reconcile its Git outcome before revoking')
       const attempts = await this.readAttemptsIfPresentLocked()
       const bound = task.activeAttemptId === undefined ? undefined : attempts.attempts.find((entry) => entry.id === task.activeAttemptId)
       // A `revoking` attempt is resumable: the durable intermediate state exists
@@ -1887,7 +2485,7 @@ export class TaskStore {
       return this.settleRevocation(task, attempt, false, request, reason)
     }
     try { await this.interruptSession(attempt.sessionId, reason) } catch { /* the fence is what protects the task */ }
-    const quiesced = await this.awaitQuiescence(attempt.sessionId, this.quiescenceTimeoutMs)
+    const quiesced = await this.awaitQuiescence(attempt.sessionId, this.quiescenceTimeoutMs).catch(() => false)
     return this.settleRevocation(task, attempt, quiesced, request, reason)
   }
 
@@ -1900,11 +2498,14 @@ export class TaskStore {
       const attempts = await this.readAttemptsIfPresentLocked()
       const stored = attempts.attempts.find((entry) => entry.id === attempt.id)
       if (stored === undefined) fail(`attempt not found: ${attempt.id}`)
+      if (current.activeAttemptId !== stored.id || stored.status !== 'revoking' || current.archivedPath !== undefined) {
+        throw new LiveTeamsError(ERROR_CODES.REVISION_CONFLICT, 'task or attempt changed while waiting for Session quiescence; read it again')
+      }
       const team = await this.readTeamLocked()
       const now = Date.now()
       if (!quiesced) {
         const escalated: TeamTask = { ...current, status: 'needs_human', updatedAt: now, revision: current.revision + 1 }
-        const nextTasks: TasksState = { ...tasks, schemaVersion: CURRENT_SCHEMA_VERSION, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === current.id ? escalated : entry) }
+        const nextTasks: TasksState = { ...tasks, schemaVersion: TASKS_SCHEMA_VERSION, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === current.id ? escalated : entry) }
         await atomicWriteJson(this.location.file, nextTasks)
         await this.appendAudit({ kind: 'attempt/revoke-timeout', taskId: current.id, attemptId: attempt.id, memberId: attempt.memberId, reason, actor: request.actor, at: now, revision: nextTasks.revision })
         return { task: clone(escalated), attempt: clone(stored), quiesced: false, reassigned: false }
@@ -1921,19 +2522,49 @@ export class TaskStore {
       const reassigned = nextAssignee !== undefined && nextAssignee !== current.assignee
       const ready: TeamTask = {
         ...current,
-        status: nextAssignee === undefined || current.route === undefined || current.acceptance.length === 0 ? 'draft' : 'ready',
+        // Revocation stops work; it is not permission for automatic dispatch to start it again.
+        status: 'draft',
+        awaitsDecision: false,
         updatedAt: now,
         revision: current.revision + 1,
       }
       if (nextAssignee === undefined) delete ready.assignee
       else ready.assignee = nextAssignee
       delete ready.activeAttemptId
-      const nextTasks: TasksState = { ...tasks, schemaVersion: CURRENT_SCHEMA_VERSION, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === current.id ? ready : entry) }
+      const nextTasks: TasksState = { ...tasks, schemaVersion: TASKS_SCHEMA_VERSION, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === current.id ? ready : entry) }
       await atomicWriteJson(this.location.attemptsFile, nextAttempts)
       await atomicWriteJson(this.location.file, nextTasks)
       await this.appendAudit({ kind: 'attempt/revoked', taskId: current.id, attemptId: stored.id, memberId: stored.memberId, reason, quiesced, actor: request.actor, at: now, revision: nextAttempts.revision })
       if (reassigned) await this.appendAudit({ kind: 'task/reassigned', taskId: current.id, from: current.assignee, to: nextAssignee, actor: request.actor, at: now, revision: nextTasks.revision })
       return { task: clone(ready), attempt: clone(revoked), quiesced: true, reassigned }
+    })
+  }
+
+  /** Explicitly release parked work; no attempt is minted until the normal claim path runs. */
+  async resumeTask(request: { taskId: string; actor: string; expectedRevision?: number }): Promise<{ task: TeamTask }> {
+    if (!candidateId(request.taskId) || request.actor.length === 0) fail('invalid resume request')
+    return withProcessLock(this.location.teamFile, async () => {
+      const tasks = await this.readTasksIfPresentLocked()
+      const task = tasks.tasks.find((entry) => entry.id === request.taskId)
+      if (task === undefined) fail(`task not found: ${request.taskId}`)
+      const team = await this.readTeamLocked()
+      if (!isLeadOrHuman(team, request.actor)) fail(`only the lead may resume tasks; ask ${leadMemberIdForMessage(team)}`)
+      if (request.expectedRevision !== undefined && request.expectedRevision !== tasks.revision) {
+        throw new LiveTeamsError(ERROR_CODES.REVISION_CONFLICT, `expected revision ${request.expectedRevision}, actual ${tasks.revision}`)
+      }
+      if (task.status !== 'draft' || task.archivedPath !== undefined) fail('only a parked draft task can be resumed')
+      const attempts = await this.readAttemptsIfPresentLocked()
+      if (attempts.attempts.some((entry) => entry.taskId === task.id && (entry.status === 'active' || entry.status === 'revoking'))) fail('task still has an active or revoking attempt')
+      if (task.integrationPending !== undefined) fail('task has an unresolved integration')
+      const contract = this.validateContract({ ...task, humanContact: task.humanContact ?? 'none', assignee: task.assignee, route: task.route, checks: task.checks, why: task.why, body: task.body, dependsOn: task.dependsOn, paths: task.paths }, team, tasks.tasks, task.id)
+      if (contract.status !== 'ready') fail('resume requires an assignee, route and acceptance criteria')
+      const now = Date.now()
+      const nextTask: TeamTask = { ...task, status: 'ready', awaitsDecision: false, revision: task.revision + 1, updatedAt: now }
+      delete nextTask.activeAttemptId
+      const nextTasks: TasksState = { ...tasks, revision: tasks.revision + 1, tasks: tasks.tasks.map((entry) => entry.id === task.id ? nextTask : entry) }
+      await atomicWriteJson(this.location.file, nextTasks)
+      await this.appendAudit({ kind: 'task/resumed', taskId: task.id, actor: request.actor, at: now, revision: nextTasks.revision })
+      return { task: clone(nextTask) }
     })
   }
 
@@ -2008,7 +2639,8 @@ export class TaskStore {
       const auditAt = Date.now()
       await this.appendAudit({ kind: 'task/created', id, taskId: id, title: task.title, assignee: task.assignee, routeType: task.route?.type, actor: request.actor, at: auditAt, revision: next.revision })
       await this.appendAudit({ kind: 'task/document', id, taskId: id, path: documentPath, actor: request.actor, at: Date.now() })
-      return { task: clone(task), documentPath }
+      const warnings = await diagnosePaths(this.workspacePath, task.paths)
+      return { task: clone(task), documentPath, ...(warnings.length === 0 ? {} : { warnings }) }
     })
   }
 

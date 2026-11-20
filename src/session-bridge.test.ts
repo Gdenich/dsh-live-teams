@@ -34,4 +34,65 @@ describe('SessionBridge', () => {
   it('interrupt maps missing', async () => { await expect(bridgeOf(fakeController({ cancel: () => { throw new PlatformError('session/not-found', 'gone') } })).interrupt('s-12', 'reason')).rejects.toMatchObject({ code: 'SESSION_NOT_FOUND' }) })
   it('reconcile skips missing', async () => { const descriptors = await bridgeOf(fakeController({ inspect: (id) => id === 'gone' ? (() => { throw new PlatformError('session/not-found', 'gone') })() : { meta: { id, workspaceId: 'ws-1' }, events: [] } })).reconcile(['alive', 'gone']); expect(descriptors.map((entry) => entry.sessionId)).toEqual(['alive']) })
   it('composition without controller fails loudly', () => { expect(() => createSessionBridge({ controller: undefined })).toThrowError(expect.objectContaining({ code: 'CAPABILITY_UNAVAILABLE' })) })
+
+  // DSH 0.2.2-rc.1 removed sessionController.inspect; ctx.sessionQuery.load returns the same
+  // header and events. These regressions keep both host generations working.
+  it('inspects through sessionQuery.load when the controller has no inspect', async () => {
+    const { inspect: _removed, ...controller } = fakeController()
+    const bridge = createSessionBridge({ controller, sessionQuery: { load: async (id: string) => ({ header: { id, cwd: '/w', workspaceId: 'ws-1', agentPreset: 'builder' }, inheritedEventCount: 0, events: [] }) } })
+    const descriptor = await bridge.inspect('s-load')
+    expect(descriptor?.workspaceId).toBe('ws-1')
+    expect(descriptor?.cwd).toBe('/w')
+    expect(descriptor?.agentPreset).toBe('builder')
+  })
+
+  it('observes an exact prompt through sessionQuery.load', async () => {
+    const { inspect: _removed, ...controller } = fakeController()
+    const events: Array<Record<string, unknown>> = [
+      { type: 'turn/start', seq: 1, data: { turn: 1 } },
+      { type: 'user/message', seq: 2, time: 5, data: { source: { kind: 'user', rpcId: 'r-load' } } },
+      { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
+    const bridge = createSessionBridge({ controller, sessionQuery: { load: async (id: string) => ({ header: { id }, events }) } })
+    await expect(bridge.observeRequest('s-load', 'r-load')).resolves.toEqual({ state: 'completed', turn: 1, inputSeq: 2 })
+    await expect(bridge.observeHumanActivity('s-load', 0, ['r-load'])).resolves.toBe(false)
+    events.push({ type: 'user/message', seq: 4, time: 10, data: { source: { kind: 'user', rpcId: 'human-direct' } } })
+    await expect(bridge.observeHumanActivity('s-load', 0, ['r-load'])).resolves.toBe(true)
+  })
+
+  it('still prefers controller.inspect when an older host offers both', async () => {
+    const controller = fakeController({ inspect: () => ({ meta: { id: 's-old' }, events: [] }) })
+    const bridge = createSessionBridge({ controller, sessionQuery: { load: () => { throw new Error('load must not be used') } } })
+    await expect(bridge.inspect('s-old')).resolves.toMatchObject({ sessionId: 's-old' })
+  })
+
+  it('inspects a live Session when no inspection service is reachable', async () => {
+    const { inspect: _removed, ...controller } = fakeController()
+    const bridge = createSessionBridge({
+      controller,
+      liveSession: (id: string) => ({ header: { id, cwd: '/w', workspaceId: 'ws-live' }, inheritedEventCount: 0, snapshotEvents: () => [] }),
+    })
+    await expect(bridge.inspect('s-live')).resolves.toMatchObject({ sessionId: 's-live', workspaceId: 'ws-live', cwd: '/w' })
+  })
+
+  it('falls back to the visible Session list for a cold descriptor', async () => {
+    const { inspect: _removed, ...controllerBase } = fakeController()
+    const controller = { ...controllerBase, async list() { return { items: [{ sessionId: 's-cold', cwd: '/w', workspaceId: 'ws-cold' }] } } }
+    const bridge = createSessionBridge({ controller })
+    await expect(bridge.inspect('s-cold')).resolves.toMatchObject({ sessionId: 's-cold', cwd: '/w', workspaceId: 'ws-cold' })
+  })
+
+  it('resolves sessionQuery lazily when the service appears after mount', async () => {
+    const { inspect: _removed, ...controller } = fakeController()
+    let query: { load?: (id: string) => Promise<unknown> } | undefined
+    const bridge = createSessionBridge({ controller, sessionQuery: () => query })
+    await expect(bridge.inspect('s-late')).rejects.toMatchObject({ code: 'CAPABILITY_UNAVAILABLE' })
+    query = { load: async (id: string) => ({ header: { id, workspaceId: 'ws-late' }, events: [] }) }
+    await expect(bridge.inspect('s-late')).resolves.toMatchObject({ sessionId: 's-late', workspaceId: 'ws-late' })
+  })
+
+  it('refuses inspection when the host offers neither API', async () => {
+    const { inspect: _removed, ...controller } = fakeController()
+    await expect(createSessionBridge({ controller }).inspect('s-none')).rejects.toMatchObject({ code: 'CAPABILITY_UNAVAILABLE' })
+  })
 })

@@ -200,6 +200,8 @@ export type MailboxOptions = {
   /** Optional policy gate, called before any mailbox row is persisted. */
   authorize?: (request: MailboxAuthorizeRequest) => void | Promise<void>
   resolveSessionSender?: (sessionId: string) => Promise<string | undefined> | string | undefined
+  /** Durable guarded scheduler traffic must still be authorized on background retries. */
+  canDeliver?: (message: TeamMessage, recipient: MailboxRecipient) => Promise<boolean>
   appendAudit?: (event: MailboxAuditEvent) => Promise<void>
   now?: () => number
   leaseMs?: number
@@ -327,6 +329,7 @@ export class MailboxService {
   private readonly listRecipients: MailboxOptions['listRecipients']
   private readonly authorize: MailboxOptions['authorize']
   private readonly resolveSessionSender: MailboxOptions['resolveSessionSender']
+  private readonly canDeliver: MailboxOptions['canDeliver']
   private readonly appendAudit: MailboxOptions['appendAudit']
   private readonly now: () => number
   private readonly leaseMs: number
@@ -344,6 +347,7 @@ export class MailboxService {
     this.teamId = options.teamId
     this.queue = options.queue
     this.listRecipients = options.listRecipients
+    this.canDeliver = options.canDeliver
     this.authorize = options.authorize
     this.resolveSessionSender = options.resolveSessionSender
     this.appendAudit = options.appendAudit
@@ -371,7 +375,7 @@ export class MailboxService {
    * public entries derive the sender instead — from the calling Session binding
    * for member traffic, and from the host itself for human and scheduler paths.
    */
-  private async send(draftValue: unknown, actorValue: unknown): Promise<SendResult> {
+  private async send(draftValue: unknown, actorValue: unknown, once = false): Promise<SendResult> {
     const draft = requestDraft(draftValue)
     const actor = senderActor(actorValue)
     const from = await this.resolveFrom(actor)
@@ -382,8 +386,16 @@ export class MailboxService {
       // create a delivery for a non-member by skipping a pre-check.
       const availableRecipients = await this.listRecipients()
       const resolved = resolveMailboxRecipient(draft.to, availableRecipients)
-      const recipients = resolved.recipient === 'team' ? availableRecipients.filter((recipient) => recipient.active !== false) : []
+      const recipients = resolved.recipient === 'team' ? availableRecipients.filter((recipient) => recipient.active !== false && (actor.type !== 'session' || recipient.memberId !== from)) : []
       if (this.authorize !== undefined) await this.authorize({ from, to: resolved.recipient })
+      if (resolved.recipient === 'team' && recipients.length === 0) throw new LiveTeamsError(ERROR_CODES.CAPABILITY_UNAVAILABLE, 'team broadcast has no other active recipients')
+      if (once) {
+        const existing = snapshot.messages.find(message => message.from === 'scheduler' && message.threadId === draft.threadId)
+        if (existing !== undefined) {
+          if (existing.to !== resolved.recipient || existing.kind !== draft.kind || existing.content !== draft.content) throw new LiveTeamsError(ERROR_CODES.DELIVERY_REJECTED, 'scheduler notification identity reused with different content')
+          return { message: cloneMessage(existing), deliveries: snapshot.deliveries.filter(delivery => delivery.messageId === existing.id).map(cloneDelivery) }
+        }
+      }
       const message: TeamMessage = {
         id: randomUUID(), teamId: this.teamId, from, to: resolved.recipient, kind: draft.kind, content: draft.content,
         ...(draft.threadId === undefined ? {} : { threadId: draft.threadId }), createdAt: this.now(),
@@ -400,13 +412,21 @@ export class MailboxService {
     })
     if (!this.autoDeliver) return result
     const delivered: MessageDelivery[] = []
-    for (const delivery of result.deliveries) delivered.push(await this.deliver(delivery.id))
+    for (const delivery of result.deliveries) {
+      if (once && (delivery.state === 'failed' || delivery.state === 'leased' && delivery.claimedAt !== undefined && delivery.claimedAt + this.leaseMs > this.now())) delivered.push(delivery)
+      else delivered.push(await this.deliver(delivery.id))
+    }
     return { message: result.message, deliveries: delivered }
   }
 
   async sendFromSession(sessionId: string, draft: MessageDraft): Promise<SendResult> { return this.send(draft, { type: 'session', sessionId }) }
   async sendFromHuman(draft: MessageDraft): Promise<SendResult> { return this.send(draft, { type: 'human' }) }
   async sendFromScheduler(draft: MessageDraft): Promise<SendResult> { return this.send(draft, { type: 'scheduler' }) }
+  /** Internal outbox identity uses the existing immutable thread field; no mailbox schema change. */
+  async sendFromSchedulerOnce(draft: MessageDraft): Promise<SendResult> {
+    if (text(draft.threadId) === undefined) throw new LiveTeamsError(ERROR_CODES.DELIVERY_REJECTED, 'scheduler-once requires a stable thread identity')
+    return withProcessLock(`${this.lockFile}:scheduler-once:${draft.threadId}`, () => this.send(draft, { type: 'scheduler' }, true))
+  }
 
   async claimDelivery(deliveryId: string): Promise<MessageDelivery | undefined> {
     let leased: MessageDelivery | undefined
@@ -442,7 +462,7 @@ export class MailboxService {
     if (claimed === undefined) {
       const current = await this.getDelivery(deliveryId)
       if (current === undefined) throw new LiveTeamsError(ERROR_CODES.DELIVERY_REJECTED, `unknown mailbox delivery "${deliveryId}"`)
-      if (current.state === 'leased') throw new LiveTeamsError(ERROR_CODES.DELIVERY_REJECTED, 'mailbox delivery lease is held')
+      if (current.state === 'leased') return current // Another owner is delivering; this is pending, not refusal.
       if (current.state === 'failed') throw new LiveTeamsError(ERROR_CODES.DELIVERY_REJECTED, current.failure ?? 'mailbox delivery failed')
       return current
     }
@@ -453,6 +473,7 @@ export class MailboxService {
     const recipient = (await this.listRecipients()).find((entry) => entry.memberId === claimed.recipient && entry.active !== false)
     if (recipient === undefined || recipient.sessionId === undefined || recipient.bindingGeneration === undefined) return this.fail(claimed.id, NO_SESSION_FAILURE)
     try {
+      if (this.canDeliver !== undefined && !await this.canDeliver(message, recipient)) return this.fail(claimed.id, 'automatic review return capability is no longer current')
       // A direction asks to steer at a safe boundary, but steering is only
       // possible into an active turn. When the transport refuses it — at
       // admission or at dispatch — the same message is queued instead of being
@@ -535,7 +556,7 @@ export class MailboxService {
       const current = snapshot.deliveries[index]
       if (current === undefined) throw new LiveTeamsError(ERROR_CODES.STATE_CORRUPT, 'mailbox delivery disappeared')
       if (current.state === 'delivered' || current.state === 'acknowledged') return
-      if (current.state === 'leased' && current.claimedAt !== undefined && current.claimedAt + this.leaseMs > this.now()) throw new LiveTeamsError(ERROR_CODES.DELIVERY_REJECTED, 'mailbox delivery lease is held')
+      if (current.state === 'leased' && current.claimedAt !== undefined && current.claimedAt + this.leaseMs > this.now()) return
       if (current.ackPolicy !== 'delivery' && current.ackPolicy !== 'formal' && current.ackPolicy !== 'consumption') throw new LiveTeamsError(ERROR_CODES.DELIVERY_REJECTED, 'mailbox acknowledgement policy cannot be retried')
       const next: MessageDelivery = { ...current, state: 'stored', revision: current.revision + 1 }
       delete next.claimedAt

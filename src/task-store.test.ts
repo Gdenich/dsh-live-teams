@@ -46,6 +46,17 @@ async function cleanup(workspace: string): Promise<void> { await rm(workspace, {
 function execution(sessionId: string): ToolRunContext { return { agent: { session: { id: sessionId } } } as unknown as ToolRunContext }
 
 describe('B19 durable task store', () => {
+  it('warns about unmatched contract paths without refusing creation or update', async () => {
+    const value = await fresh()
+    try {
+      const created = await value.store.createTask(request({ paths: ['backend/alembic/**'] }))
+      expect(created.task.status).toBe('ready')
+      expect(created).toMatchObject({ warnings: [{ code: 'path-no-match', pattern: 'backend/alembic/**' }] })
+      const updated = await value.store.updateTask({ taskId: created.task.id, actor: 'lead', paths: ['new-module/**'] })
+      expect(updated).toMatchObject({ warnings: [{ code: 'path-no-match', pattern: 'new-module/**' }] })
+      expect(updated.task.paths).toEqual(['new-module/**'])
+    } finally { await cleanup(value.workspace) }
+  })
   it('creates a ready task when assignee and route are present', async () => {
     const value = await fresh()
     try {
@@ -422,7 +433,131 @@ describe('B19 durable task store', () => {
       return { taskId: created.task.id, attemptId: claimed.attempt.id }
     }
 
-    it('invalidates the attempt before asking the session to stop, then returns the task to ready', async () => {
+    it('parks revoked work instead of making it automatically dispatchable', async () => {
+      const value = await revocable()
+      try {
+        const { taskId } = await inFlight(value.store)
+        const revoked = await value.store.revokeTask({ taskId, actor: 'lead', reason: 'stop, do not restart' })
+        expect(revoked.task.status).toBe('draft')
+        expect(revoked.task.assignee).toBe('worker')
+        expect(revoked.task.activeAttemptId).toBeUndefined()
+        await expect(value.store.claimTask({ ...claim, taskId })).rejects.toThrow(/not ready|status/u)
+      } finally { await cleanup(value.workspace) }
+    })
+
+    it('does not cancel and archive a task when its running Session cannot be stopped', async () => {
+      const value = await revocable({ quiesce: false })
+      try {
+        const { taskId, attemptId } = await inFlight(value.store)
+        await value.store.cancelTask({ taskId, actor: 'lead', reason: 'cancel running work' })
+        const task = (await value.store.listTasks({ includeArchived: true })).find((entry) => entry.id === taskId)
+        expect(task?.status).toBe('needs_human')
+        expect(task?.archivedPath).toBeUndefined()
+        const attempt = (await value.store.readAttempts()).attempts.find((entry) => entry.id === attemptId)
+        expect(attempt?.status).toBe('revoking')
+        expect(value.calls).toEqual(['interrupt:s-worker:cancel running work', 'quiesce:s-worker'])
+        expect(value.audit.map((event) => (event as { kind: string }).kind)).not.toContain('task/cancelled')
+      } finally { await cleanup(value.workspace) }
+    })
+
+    it('does not claim a stop when runtime hooks are absent or quiescence observation throws', async () => {
+      const value = await fresh()
+      try {
+        const { taskId } = await inFlight(value.store)
+        expect((await value.store.cancelTask({ taskId, actor: 'lead', reason: 'cannot observe runtime' })).task.status).toBe('needs_human')
+        const throwing = createTaskStore({ workspacePath: value.workspace, teamId: 'team-1', appendAudit: async () => undefined, interruptSession: async () => { throw new Error('runtime unavailable') }, awaitQuiescence: async () => { throw new Error('status unavailable') } })
+        const result = await throwing.cancelTask({ taskId, actor: 'lead', reason: 'runtime still unavailable' })
+        expect(result.quiesced).toBe(false)
+        expect(result.task.status).toBe('needs_human')
+        expect(result.archivedPath).toBeUndefined()
+      } finally { await cleanup(value.workspace) }
+    })
+
+    it('refuses cancellation when the active attempt pointer cannot account for the writer', async () => {
+      const value = await fresh()
+      try {
+        const { taskId } = await inFlight(value.store)
+        const tasksFile = join(value.workspace, '.dsh-live-teams', 'teams', 'team-1', 'tasks.json')
+        const state = JSON.parse(await readFile(tasksFile, 'utf8')) as { tasks: Array<{ id: string; activeAttemptId?: string }> }
+        const task = state.tasks.find((entry) => entry.id === taskId)!
+        task.activeAttemptId = 'attempt-missing'
+        await writeFile(tasksFile, JSON.stringify(state))
+        await expect(value.store.cancelTask({ taskId, actor: 'lead', reason: 'unknown runtime' })).rejects.toThrow(/ownership is inconsistent/)
+        expect((await value.store.readTask(taskId)).task.archivedPath).toBeUndefined()
+        expect(value.audit.map((event) => (event as { kind: string }).kind)).not.toContain('task/cancelled')
+      } finally { await cleanup(value.workspace) }
+    })
+
+    it('cancels never-started work without runtime hooks, preserving it in the archive', async () => {
+      const value = await fresh()
+      try {
+        const created = await value.store.createTask(request())
+        const result = await value.store.cancelTask({ taskId: created.task.id, actor: 'lead', reason: 'superseded before dispatch' })
+        expect(result.quiesced).toBe(true)
+        expect(result.task.status).toBe('cancelled')
+        expect(result.archivedPath).toBeDefined()
+        expect((await value.store.readAttempts()).attempts).toEqual([])
+      } finally { await cleanup(value.workspace) }
+    })
+
+    it('retries cancellation after an unobserved stop, without inventing a new attempt', async () => {
+      const runtime = { quiesce: false }
+      const value = await revocable(runtime)
+      try {
+        const { taskId, attemptId } = await inFlight(value.store)
+        const pending = await value.store.cancelTask({ taskId, actor: 'lead', reason: 'stop before archiving' })
+        expect(pending.quiesced).toBe(false)
+        runtime.quiesce = true
+        const closed = await value.store.cancelTask({ taskId, actor: 'lead', reason: 'stop before archiving' })
+        expect(closed.quiesced).toBe(true)
+        expect(closed.task.status).toBe('cancelled')
+        const attempts = (await value.store.readAttempts()).attempts.filter((entry) => entry.taskId === taskId)
+        expect(attempts).toHaveLength(1)
+        expect(attempts[0]).toMatchObject({ id: attemptId, status: 'revoked' })
+        expect(await value.store.activeTaskForMember('worker')).toBeUndefined()
+        expect(value.store.activeTaskForMemberSync('worker')).toBeUndefined()
+      } finally { await cleanup(value.workspace) }
+    })
+
+    it('keeps revoked work parked even when its contract is corrected', async () => {
+      const value = await revocable()
+      try {
+        const { taskId } = await inFlight(value.store)
+        await value.store.revokeTask({ taskId, actor: 'lead', reason: 'correct the typo before restarting' })
+        const corrected = await value.store.updateTask({ taskId, actor: 'lead', title: 'Corrected title' })
+        expect(corrected.task.status).toBe('draft')
+        await expect(value.store.claimTask({ ...claim, taskId })).rejects.toThrow(/not ready/)
+        expect((await value.store.resumeTask({ taskId, actor: 'lead' })).task.status).toBe('ready')
+      } finally { await cleanup(value.workspace) }
+    })
+
+    it('requires an explicit authorized restart and fences stale decisions', async () => {
+      const value = await revocable()
+      try {
+        const { taskId } = await inFlight(value.store)
+        await value.store.revokeTask({ taskId, actor: 'lead', reason: 'park it' })
+        await expect(value.store.resumeTask({ taskId, actor: 'worker' })).rejects.toThrow(/only the lead/)
+        await expect(value.store.resumeTask({ taskId, actor: 'lead', expectedRevision: 0 })).rejects.toThrow(/expected revision/)
+        expect(await value.store.activeTaskForMember('worker')).toBeUndefined()
+        const resumed = await value.store.resumeTask({ taskId, actor: 'human:desktop' })
+        expect(resumed.task.status).toBe('ready')
+        expect(await value.store.activeTaskForMember('worker')).toBeUndefined()
+        await expect(value.store.resumeTask({ taskId, actor: 'lead' })).rejects.toThrow(/parked draft/)
+      } finally { await cleanup(value.workspace) }
+    })
+
+    it('selects the actual owned attempt rather than a newer queued task for context', async () => {
+      const value = await revocable()
+      try {
+        const { taskId } = await inFlight(value.store)
+        const queued = await value.store.createTask(request({ title: 'Queued, not my current assignment' }))
+        expect(queued.task.status).toBe('ready')
+        expect((await value.store.activeTaskForMember('worker'))?.id).toBe(taskId)
+        expect(value.store.activeTaskForMemberSync('worker')?.id).toBe(taskId)
+      } finally { await cleanup(value.workspace) }
+    })
+
+    it('invalidates the attempt before asking the session to stop, then parks the task', async () => {
       const value = await revocable()
       try {
         const { taskId, attemptId } = await inFlight(value.store)
@@ -430,7 +565,7 @@ describe('B19 durable task store', () => {
         expect(revoked.quiesced).toBe(true)
         expect(revoked.reassigned).toBe(false)
         expect(revoked.attempt).toMatchObject({ id: attemptId, status: 'revoked' })
-        expect(revoked.task).toMatchObject({ status: 'ready', assignee: 'worker' })
+        expect(revoked.task).toMatchObject({ status: 'draft', assignee: 'worker' })
         expect(revoked.task.activeAttemptId).toBeUndefined()
         // The fence is durable before the interrupt: order is the contract.
         expect(value.calls).toEqual(['interrupt:s-worker:session is wedged', 'quiesce:s-worker'])
@@ -519,7 +654,7 @@ describe('B19 durable task store', () => {
         await writeFile(attemptsFile, `${JSON.stringify(raw, null, 2)}\n`)
         const resumed = await value.store.revokeTask({ taskId, actor: 'lead', reason: 'finish what was started' })
         expect(resumed.attempt.status).toBe('revoked')
-        expect(resumed.task.status).toBe('ready')
+        expect(resumed.task.status).toBe('draft')
         // The crash was simulated outside the store, so the resume must not claim a
         // fresh invalidation: it settles the one that already happened.
         const kinds = value.audit.map((event) => (event as { kind: string }).kind)
@@ -549,6 +684,7 @@ describe('B19 durable task store', () => {
         const first = (await value.store.readAttempts()).attempts.filter((entry) => entry.taskId === taskId)
         expect(first.map((entry) => entry.generation)).toEqual([1])
         await value.store.revokeTask({ taskId, actor: 'lead', reason: 'restart' })
+        await value.store.resumeTask({ taskId, actor: 'lead' })
         const second = await value.store.claimTask({ ...claim, taskId })
         expect(second.attempt.generation).toBe(2)
         const all = (await value.store.readAttempts()).attempts.filter((entry) => entry.taskId === taskId)
@@ -686,7 +822,7 @@ describe('B19 durable task store', () => {
         return member === undefined ? undefined : { mailbox: {} as never, teamId: current.teamId, teamName: 'B19', member, team: current, taskStore: value.store, live: () => true }
       }
       registerMemberTools({ register: (tool) => { tools.push(tool); return undefined } }, async (sessionId) => binding(sessionId), false, false, true)
-      expect(tools.map((tool) => tool.name)).toEqual(['live_team_send', 'live_team_ack_message', 'live_team_context', 'live_team_create_task', 'live_team_update_task', 'live_team_revoke_task', 'live_team_read_task', 'live_team_list_tasks', 'live_team_status'])
+      expect(tools.map((tool) => tool.name)).toEqual(['live_team_send', 'live_team_ack_message', 'live_team_context', 'live_team_create_task', 'live_team_update_task', 'live_team_cancel_task', 'live_team_resume_task', 'live_team_revoke_task', 'live_team_read_task', 'live_team_list_tasks', 'live_team_status'])
       const create = tools.find((tool) => tool.name === 'live_team_create_task')!
       await expect(create.execute({ ...request(), actor: 'worker' }, execution('s-worker'))).rejects.toThrow(/only the lead/u)
       await expect(create.execute(request(), execution('s-lead'))).resolves.toMatchObject({ task: { status: 'ready' } })
@@ -694,7 +830,109 @@ describe('B19 durable task store', () => {
   })
 })
 
+/**
+ * The oh-my-claude bridge marks every DSH tool `readOnlyHint: true`, which is what makes Claude Code
+ * run them concurrently — so two mutating team calls can arrive in one answer, from one member, at
+ * the same moment. The store must serialize them and refuse the loser rather than lose an update.
+ */
+describe('concurrent mutations from one member', () => {
+  it('keeps one of two parallel contract edits and refuses the other by revision', async () => {
+    const { mkdtemp, rm } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { TeamStore } = await import('./team-store.js')
+    const workspace = await mkdtemp(join(tmpdir(), 'live-teams-concurrent-'))
+    try {
+      const team = new TeamStore({ workspacePath: workspace, workspaceId: 'ws', teamId: 'team-1' })
+      await team.open(); const opened = await team.open()
+      await team.commit('team-1', { expectedRevision: opened.revision, mutate: (state) => { state.members.push({ memberId: 'm-lead', displayName: 'Lead', role: 'lead', availability: 'available', bindingGeneration: 1, contractRevision: 0 }); state.leadMemberId = 'm-lead' } })
+      const store = createTaskStore({ workspacePath: workspace, teamId: 'team-1', appendAudit: async () => undefined })
+      const created = await store.createTask({ title: 'Contested', kind: 'research', assignee: 'm-lead', route: { type: 'report', to: 'human' }, acceptance: ['notes'], actor: 'm-lead' })
+
+      // Both edits read the same revision, as two calls in one model answer would.
+      const revision = created.task.revision
+      const results = await Promise.allSettled([
+        store.updateTask({ taskId: created.task.id, expectedRevision: revision, title: 'First writer', actor: 'm-lead' }),
+        store.updateTask({ taskId: created.task.id, expectedRevision: revision, title: 'Second writer', actor: 'm-lead' }),
+      ])
+      const won = results.filter((entry) => entry.status === 'fulfilled')
+      const lost = results.filter((entry) => entry.status === 'rejected')
+      expect(won).toHaveLength(1)
+      expect(lost).toHaveLength(1)
+      // The loser is refused by the revision fence, not silently dropped.
+      expect(String((lost[0] as PromiseRejectedResult).reason)).toMatch(/revision|conflict|stale/iu)
+      const after = (await store.readTask(created.task.id)).task
+      expect(['First writer', 'Second writer']).toContain(after.title)
+      expect(after.revision).toBe(revision + 1)
+
+      // A revocation racing an edit: the task must not end up revoked and edited at once.
+      const racing = await Promise.allSettled([
+        store.updateTask({ taskId: created.task.id, expectedRevision: after.revision, title: 'Edited during revoke', actor: 'm-lead' }),
+        store.revokeTask({ taskId: created.task.id, reason: 'racing revocation', actor: 'm-lead' }),
+      ])
+      expect(racing.some((entry) => entry.status === 'fulfilled')).toBe(true)
+      const settled = (await store.readTask(created.task.id)).task
+      expect(['draft', 'ready', 'cancelled', 'needs_human']).toContain(settled.status)
+      expect(settled.revision).toBeGreaterThan(after.revision)
+    } finally { await rm(workspace, { recursive: true, force: true }) }
+  })
+})
+
+describe('the migration that reaches a live stand', () => {
+  it('gives a task with an undecided submission its flag back', async () => {
+    // The flag was added after a real stand: the store and the panel both derived "is a decision
+    // owed" from the status, and a returned task is `in_progress` while its submission sits on the
+    // table. State written before the flag existed must gain it, or the task cannot be closed.
+    const { applyMigration, planMigration } = await import('./migrations.js')
+    const state = { schemaVersion: 1, teamId: 'team-1', revision: 3, tasks: [
+      { id: 'task-1', latestSubmissionId: 'sub-1', acceptedSubmissionId: 'sub-1' },
+      { id: 'task-2', latestSubmissionId: 'sub-2' },
+      { id: 'task-3' },
+    ] }
+    const plan = planMigration(1, 2, 'task state')
+    expect(plan.kind).toBe('migrate')
+    const migrated = applyMigration(state, plan) as { tasks: { id: string; awaitsDecision?: boolean }[] }
+    expect(migrated.tasks.find((task) => task.id === 'task-1')?.awaitsDecision).toBeUndefined()
+    expect(migrated.tasks.find((task) => task.id === 'task-2')?.awaitsDecision).toBe(true)
+    expect(migrated.tasks.find((task) => task.id === 'task-3')?.awaitsDecision).toBeUndefined()
+  })
+})
+
 describe('state migrations', () => {
+  it.each([false, true])('releases the team lock before a migration audit lazily opens the TeamStore (cold boot; late future state: %s)', async (lateFuture) => {
+    const { mkdtemp, mkdir, readFile, rm, writeFile } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { TeamStore } = await import('./team-store.js')
+    const workspace = await mkdtemp(join(tmpdir(), 'live-teams-cold-migration-'))
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      const directory = join(workspace, '.dsh-live-teams', 'teams', 'team-1')
+      await mkdir(directory, { recursive: true })
+      const original = JSON.stringify({ schemaVersion: 1, revision: 0, teamId: 'team-1', tasks: [] })
+      await writeFile(join(directory, 'tasks.json'), original)
+      if (lateFuture) await writeFile(join(directory, 'attempts.json'), JSON.stringify({ schemaVersion: 99, teamId: 'team-1', attempts: [] }))
+      const team = new TeamStore({ workspacePath: workspace, workspaceId: 'ws', teamId: 'team-1' })
+      let opening: Promise<TeamStore> | undefined
+      const ensureStore = () => opening ??= team.open().then(() => team)
+      const store = createTaskStore({ workspacePath: workspace, teamId: 'team-1', appendAudit: async (event) => { await (await ensureStore()).appendEvent('team-1', event) } })
+      // Deliberately do not open the team first: that used to hide the startup cycle.
+      const migrated = Promise.race([
+        store.migrate(),
+        new Promise<never>((_resolve, reject) => { timeout = setTimeout(() => reject(new Error('cold migration deadlocked after writing schema 2')), 1500) }),
+      ])
+      if (lateFuture) await expect(migrated).rejects.toThrow(/written by a newer DSH/u)
+      else await migrated
+      expect(await readFile(join(directory, 'tasks.json.v1.bak'), 'utf8')).toBe(original)
+      expect(JSON.parse(await readFile(join(directory, 'tasks.json'), 'utf8')).schemaVersion).toBe(2)
+      expect(await store.listTasks()).toEqual([])
+      expect((await team.readEvents('team-1')).events).toEqual([expect.objectContaining({ kind: 'state/migrated', file: 'tasks.json', from: 1, to: 2 })])
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout)
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
   it('brings an older state forward, with a backup and a journal entry, and refuses a newer one', async () => {
     const { mkdtemp, readFile, readdir, rm, writeFile } = await import('node:fs/promises')
     const { tmpdir } = await import('node:os')
@@ -710,7 +948,9 @@ describe('state migrations', () => {
       // in the product today (version 1 is the first), so the step is injected here.
       const store = createTaskStore({
         workspacePath: workspace, teamId: 'team-1', appendAudit: async (event) => { audit.push(event) },
-        migrations: { 0: (state: unknown) => ({ ...(state as Record<string, unknown>), migratedFromZero: true }) },
+        // The chain has to reach the current version: 1 → 2 is the real one, so the test supplies a
+        // no-op for it and keeps its own step at 0.
+        migrations: { 0: (state: unknown) => ({ ...(state as Record<string, unknown>), migratedFromZero: true }), 1: (state: unknown) => state },
       })
       const created = await store.createTask({ title: 'Before the migration', kind: 'research', assignee: 'm-lead', route: { type: 'report', to: 'human' }, acceptance: ['notes'], actor: 'm-lead' })
       const statePath = join(workspace, '.dsh-live-teams', 'teams', 'team-1', 'tasks.json')
@@ -718,9 +958,9 @@ describe('state migrations', () => {
       await writeFile(statePath, JSON.stringify({ ...state, schemaVersion: 0 }))
 
       const result = await store.migrate()
-      expect(result.files).toEqual([expect.objectContaining({ file: 'tasks.json', from: 0, to: 1 })])
+      expect(result.files).toEqual([expect.objectContaining({ file: 'tasks.json', from: 0, to: 2 })])
       const migrated = JSON.parse(await readFile(statePath, 'utf8')) as Record<string, unknown>
-      expect(migrated.schemaVersion).toBe(1)
+      expect(migrated.schemaVersion).toBe(2)
       expect(migrated.migratedFromZero).toBe(true)
       // The task survived the migration and the original file is kept beside it.
       expect((await store.listTasks({ includeArchived: true })).map((task) => task.id)).toContain(created.task.id)
@@ -732,7 +972,7 @@ describe('state migrations', () => {
 
       // A state from the future is refused with both versions named, not as corruption.
       await writeFile(statePath, JSON.stringify({ ...migrated, schemaVersion: 99 }))
-      await expect(store.migrate()).rejects.toThrow(/written by a newer DSH \(schema 99, this build understands 1\)/u)
+      await expect(store.migrate()).rejects.toThrow(/written by a newer DSH \(schema 99, this build understands 2\)/u)
     } finally { await rm(workspace, { recursive: true, force: true }) }
   })
 })

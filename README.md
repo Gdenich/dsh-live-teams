@@ -21,7 +21,7 @@ checkout instead of the registry:
 dsh plugin --profile <profile> add github:Gdenich/dsh-live-teams
 ```
 
-Requirements: DSH Desktop 0.1.5-rc.1 or newer. The plugin checks the host when it mounts and turns
+Requirements: DSH Desktop 0.1.5-rc.1 or newer; 0.2.2-rc.1 is verified. The plugin checks the host when it mounts and turns
 the team off with a readable reason if a required service is missing, so a DSH update cannot leave it
 half-working. Supported releases are declared in `package.json` under `dsh.compatibility.dshReleases`.
 
@@ -71,6 +71,15 @@ chunk can fall outside the published `files` list, and `lib/` mirrors `src/`.
 6. Team context is recomputed from authoritative state on every assembly and is never cached.
 7. Model selection is deliberately not implemented: the platform call also rewrites the
    deployment-wide default model, and that policy needs an explicit human decision.
+
+## Task lifecycle controls
+
+- Acceptance decides on submitted work and may integrate its reviewed commit. Cancellation does not accept work or imply a PASS.
+- The lead can use `live_team_cancel_task` with a reason. A running attempt is fenced first; the Session must be observed stopped before archiving. An unconfirmed stop returns `quiesced: false` and `needs_human`, without an archive. Resolve the runtime problem and retry cancellation.
+- `live_team_revoke_task` parks work in `draft`, optionally changing the owner after a confirmed stop. It does not automatically restart it. Contract corrections on previously started, parked work keep it parked.
+- `live_team_resume_task` explicitly releases a valid parked task to `ready`. The next claim has a new attempt generation. The panel offers equivalent cancel and resume actions.
+- Contract path warnings are advisory: a path may intentionally be new. An incomplete inspection is not reported as proof that a path does not exist.
+- Contract `checks` are declarations; submitted results remain participant-authored claims, not system-executed test evidence. The reviewer records independent checks. No universal automatic test runner is supplied.
 
 ## Tests
 

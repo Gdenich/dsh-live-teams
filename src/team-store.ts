@@ -177,6 +177,23 @@ export function resolveLeadMemberId(team: Pick<TeamState, 'leadMemberId' | 'memb
 }
 
 const TEAM_ROOT = '.dsh-live-teams'
+
+/**
+ * Make the state directory ignore itself.
+ *
+ * The plugin writes `.dsh-live-teams/` into the *user's* project, and whether that shows up as
+ * untracked depends on the project's own `.gitignore` — which is not ours to edit. A one-line
+ * `.gitignore` inside the directory makes it invisible to git everywhere, the way `.git/` is, so a
+ * `git add -A` in a project that never heard of this plugin cannot pick up a team's tasks, attempts
+ * and journal. Written only when missing: an existing file is the project's business, not ours.
+ */
+async function ensureSelfIgnoringRoot(root: string): Promise<void> {
+  const marker = path.join(root, '.gitignore')
+  try {
+    if (await fileExists(marker)) return
+    await fs.writeFile(marker, '# Written by dsh-live-teams: team state is data, not source.\n*\n', 'utf8')
+  } catch { /* a read-only or absent workspace is not a reason to fail opening a team */ }
+}
 const DISABLED_MARKER = 'disabled'
 
 function canonicalWorkspacePath(value: string): string {
@@ -271,6 +288,7 @@ export class TeamStore {
     const location = this.location(workspacePath, workspaceId, teamId)
     await withProcessLock(location.file, async () => {
       await fs.mkdir(location.directory, { recursive: true })
+      await ensureSelfIgnoringRoot(path.resolve(workspacePath, TEAM_ROOT))
       if (!(await fileExists(location.file))) {
         const now = Date.now()
         await atomicWriteJson(location.file, {
@@ -571,10 +589,18 @@ export class TeamStore {
     return clone(result.value)
   }
 
-  async setLead(teamId: string, memberId: string, expectedRevision: number): Promise<TeamState> {
+  /**
+   * Name the lead, or clear the name.
+   *
+   * Clearing is a real operation, not an empty request: it returns the team to the fallback rule —
+   * whoever holds the `lead` role — which is what a team with one lead relies on anyway. The panel
+   * offered "Not set" and the server refused it with a 400, so the option did nothing.
+   */
+  async setLead(teamId: string, memberId: string | undefined, expectedRevision: number): Promise<TeamState> {
     const result = await this.commit(teamId, {
       expectedRevision,
       mutate: (state) => {
+        if (memberId === undefined) { delete state.leadMemberId; return }
         if (!state.members.some((entry) => entry.memberId === memberId)) throw new LiveTeamsError(ERROR_CODES.CAPABILITY_UNAVAILABLE, `member not found: ${memberId}`)
         state.leadMemberId = memberId
       },

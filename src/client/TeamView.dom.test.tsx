@@ -33,12 +33,14 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => {
     StateDot: () => React.createElement('span', { className: 'state-dot' }),
     Tooltip: element('span'),
     Modal: (props: Record<string, unknown>) => (props.open === true ? React.createElement('div', { role: 'dialog', 'aria-label': props.title }, props.description as React.ReactNode, props.children as React.ReactNode, props.footer as React.ReactNode) : null),
-    IconEditOutline16: () => React.createElement('span'),
-    IconPlusOutline16: () => React.createElement('span'),
-    IconPauseOutline16: () => React.createElement('span'),
-    IconPlayOutline16: () => React.createElement('span'),
-    IconRefreshOutline16: () => React.createElement('span'),
-     IconChevronDownOutline14: () => React.createElement('span', { 'data-testid': 'task-chevron' }),
+    // The names the host uses now. The panel resolves icons at runtime, so the mock has to speak the
+    // same language as the real module: a mock still exporting the old names would hide the break.
+    IconEditOutlineRegular: () => React.createElement('span'),
+    IconPlusOutlineRegular: () => React.createElement('span'),
+    IconPauseOutlineRegular: () => React.createElement('span'),
+    IconPlayOutlineRegular: () => React.createElement('span'),
+    IconRefreshOutlineRegular: () => React.createElement('span'),
+    IconChevronDownOutlineRegular: () => React.createElement('span', { 'data-testid': 'task-chevron' }),
   }
 })
 
@@ -58,8 +60,10 @@ const snapshot = {
 }
 
 const taskFixture = {
-  tasks: { teamId: 'team-1', tasks: [{ id: 'task-1', title: 'Build report', status: 'waiting', assignee: 'm-1', assigneeName: 'Build', route: { type: 'report', to: 'human' }, round: 2, roundLimit: 5, updatedAt: Date.now() }] },
-  detail: { task: { id: 'task-1', teamId: 'team-1', title: 'Build report', kind: 'implementation', status: 'waiting', assignee: 'm-1', route: { type: 'report', to: 'human' }, acceptance: ['Tests pass'], roundLimit: 5, createdBy: 'm-1', createdAt: 1, updatedAt: 2, revision: 1 }, document: '# Build report', submissions: [{ id: 'sub-1', taskId: 'task-1', attemptId: 'attempt-1', attemptGeneration: 1, artifact: { type: 'report', bodyRef: 'report.md', bodyDigest: 'digest' }, summary: 'done', checks: [{ command: 'test', status: 'passed' }], scope: { state: 'shared-tree', declared: ['packages/alpha/**'], changed: ['packages/alpha/src/a.js', 'packages/beta/src/b.js'], unexpected: ['packages/beta/src/b.js'], sharedTree: ['packages/beta/src/b.js'] }, createdAt: 2, revision: 1 }], rounds: [{ id: 'round-1', taskId: 'task-1', submissionId: 'sub-1', reviewerMemberId: 'm-1', round: 2, verdict: 'needs_revision', findings: [{ severity: 'low', problem: 'minor', requiredFix: 'fix' }], evidence: [], createdAt: 3, revision: 1 }], attempts: [{ id: 'attempt-1', memberId: 'm-1', sessionId: 'session-1', generation: 1, status: 'active', startedAt: 2, humanIntervenedAt: 3 }] },
+  // A task in `waiting` has a submission nobody has decided on: the panel reads that fact, not the
+  // status, so the fixture carries it too.
+  tasks: { teamId: 'team-1', tasks: [{ id: 'task-1', title: 'Build report', status: 'waiting', awaitsDecision: true, assignee: 'm-1', assigneeName: 'Build', route: { type: 'report', to: 'human' }, round: 2, roundLimit: 5, updatedAt: Date.now() }] },
+  detail: { task: { id: 'task-1', teamId: 'team-1', title: 'Build report', kind: 'implementation', status: 'waiting', activeAttemptId: 'attempt-1', assignee: 'm-1', route: { type: 'report', to: 'human' }, acceptance: ['Tests pass'], roundLimit: 5, createdBy: 'm-1', createdAt: 1, updatedAt: 2, revision: 1 }, document: '# Build report', submissions: [{ id: 'sub-1', taskId: 'task-1', attemptId: 'attempt-1', attemptGeneration: 1, artifact: { type: 'report', bodyRef: 'report.md', bodyDigest: 'digest' }, summary: 'done', checks: [{ command: 'test', status: 'passed' }], scope: { state: 'shared-tree', declared: ['packages/alpha/**'], changed: ['packages/alpha/src/a.js', 'packages/beta/src/b.js'], unexpected: ['packages/beta/src/b.js'], sharedTree: ['packages/beta/src/b.js'] }, createdAt: 2, revision: 1 }], rounds: [{ id: 'round-1', taskId: 'task-1', submissionId: 'sub-1', reviewerMemberId: 'm-1', round: 2, verdict: 'needs_revision', findings: [{ severity: 'low', problem: 'minor', requiredFix: 'fix' }], evidence: [], createdAt: 3, revision: 1 }], attempts: [{ id: 'attempt-1', memberId: 'm-1', sessionId: 'session-1', generation: 1, status: 'active', startedAt: 2, humanIntervenedAt: 3 }] },
 }
 
 const roles = {
@@ -85,7 +89,7 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-async function renderView(payload: { ctx?: unknown; pollMs?: number; snapshot?: unknown; roles?: unknown; attention?: unknown; rolesStatus?: number; candidates?: unknown; team?: unknown; messages?: unknown; journal?: unknown; tasks?: unknown; taskDetail?: unknown; taskActionStatus?: number; taskActionError?: string; interruptStatus?: number; messageSendStatus?: number; messageSendError?: string; grantStatus?: number; grantError?: string; dispatch?: unknown; dispatchStatus?: number; fetchCalls?: Array<{ url: string; method: string; body?: string }> } = {}): Promise<HTMLDivElement> {
+async function renderView(payload: { ctx?: unknown; pollMs?: number; snapshot?: unknown; roles?: unknown; attention?: unknown; rolesStatus?: number; candidates?: unknown; team?: unknown; messages?: unknown; journal?: unknown; tasks?: unknown; taskDetail?: unknown; taskActionStatus?: number; taskActionError?: string; taskQuiesced?: boolean; interruptStatus?: number; messageSendStatus?: number; messageSendError?: string; grantStatus?: number; grantError?: string; dispatch?: unknown; dispatchStatus?: number; fetchCalls?: Array<{ url: string; method: string; body?: string }>; candidatesNeverResolves?: boolean } = {}): Promise<HTMLDivElement> {
   vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     const method = init?.method ?? 'GET'
@@ -123,6 +127,14 @@ async function renderView(payload: { ctx?: unknown; pollMs?: number; snapshot?: 
       const status = payload.messageSendStatus ?? 200
       return new Response(JSON.stringify(status === 200 ? { accepted: true, messageId: 'msg-sent', recipients: ['m-1'], deliveries: [{ id: 'd-sent', recipient: 'm-1', state: 'delivered' }] } : { error: payload.messageSendError ?? 'server send refusal' }), { status, headers: { 'content-type': 'application/json' } })
     }
+    if (url.includes('/api/live-teams/task/cancel')) {
+      const quiesced = payload.taskQuiesced ?? true
+      return new Response(JSON.stringify({ task: { ...taskFixture.detail.task, status: quiesced ? 'cancelled' : 'needs_human' }, quiesced, ...(quiesced ? { archivedPath: 'archive/task-1.md' } : {}) }), { status: 200 })
+    }
+    if (url.includes('/api/live-teams/task/resume')) return new Response(JSON.stringify({ task: { ...taskFixture.detail.task, status: 'ready' } }), { status: 200 })
+    if (url.includes('/api/live-teams/task/create')) return new Response(JSON.stringify({ task: taskFixture.detail.task, documentPath: '/w/task-1.md', warnings: [{ code: 'path-no-match', pattern: 'packages/a/**', message: 'New path or typo' }] }), { status: 200 })
+    if (url.includes('/api/live-teams/task/update')) return new Response(JSON.stringify({ task: taskFixture.detail.task, document: '# Build report', changed: ['title'] }), { status: 200 })
+    if (url.includes('/api/live-teams/task/revoke')) return new Response(JSON.stringify({ task: { ...taskFixture.detail.task, status: 'draft' }, attempt: { ...taskFixture.detail.attempts[0], status: 'revoked' }, quiesced: true, reassigned: false }), { status: 200 })
     if (url.includes('/api/live-teams/task/accept') || url.includes('/api/live-teams/task/revise')) {
       const status = payload.taskActionStatus ?? 200
       return new Response(JSON.stringify(status === 200 ? { task: { ...taskFixture.detail.task, status: url.includes('/accept') ? 'completed' : 'in_progress' }, archivedPath: '/archive/task.md' } : { error: payload.taskActionError ?? 'server task refusal' }), { status, headers: { 'content-type': 'application/json' } })
@@ -156,10 +168,297 @@ async function renderView(payload: { ctx?: unknown; pollMs?: number; snapshot?: 
   return container
 }
 
+async function openSettings(view: HTMLElement): Promise<void> {
+  await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsSettingsToggle')?.click() })
+}
+
 const idleDispatch = {
   teamId: 'team-1', paused: false, coding: 'manual', counts: { assign: 0, active: 0, wait: 0, refused: 0 },
   tasks: [{ taskId: 'task-1', title: 'Build report', status: 'waiting', assignee: 'm-1', decision: 'wait', reason: 'human-gate', detail: 'the member is waiting for an answer' }],
 }
+
+describe('member settings hierarchy', () => {
+  it('distinguishes a reported empty contact list from missing contact metadata', async () => {
+    const view = await renderView({ snapshot: { ...snapshot, members: [{ ...snapshot.members[0], permittedContacts: [] }] } })
+    await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsMemberCollapsed')?.click() })
+    expect(view.querySelector('.dshLiveTeamsContactChips')?.textContent).toBe('noPeerContact')
+    expect(view.querySelector('.dshLiveTeamsContactChips')?.textContent).not.toContain('memberContactsUnknown')
+  })
+  it('marks a role draft without applying it or recoloring the committed profile', async () => {
+    const fetchCalls: Array<{ url: string; method: string }> = []
+    const view = await renderView({ fetchCalls })
+    await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsMemberCollapsed')?.click() })
+    const role = view.querySelector<HTMLSelectElement>('.dshLiveTeamsMemberSettings .dshLiveTeamsRoleInput')!
+    await act(async () => { role.value = 'oracle'; role.dispatchEvent(new Event('change', { bubbles: true })) })
+    expect(view.querySelector('.dshLiveTeamsDraftHint')?.textContent).toBe('memberRolePending')
+    expect(view.querySelector('.dshLiveTeamsMemberSettings .dshLiveTeamsMemberAvatar')?.getAttribute('data-agent-role')).toBe('builder')
+    expect(fetchCalls.every(call => call.method === 'GET')).toBe(true)
+  })
+  it('does not mistake unavailable contact/turn metadata for denied contacts or an idle turn', async () => {
+    const view = await renderView({ snapshot: { ...snapshot, members: [{ ...snapshot.members[0], note: undefined, status: 'unknown', sessionId: null }] } })
+    await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsMemberCollapsed')?.click() })
+    const panel = view.querySelector('.dshLiveTeamsMemberSettings')!
+    expect(panel.querySelector('.dshLiveTeamsContactChips')?.textContent).toContain('memberContactsUnknown')
+    expect(panel.querySelector('.dshLiveTeamsContactChips')?.textContent).not.toContain('noPeerContact')
+    expect(panel.querySelector('[data-member-section="session"]')?.textContent).toContain('memberTurnUnknown')
+    expect(panel.querySelector('.dshLiveTeamsInterruptButton')).toBeNull()
+    expect(panel.querySelector<HTMLButtonElement>('.dshLiveTeamsMemberOpen')?.disabled).toBe(true)
+    expect(panel.querySelector('[data-member-section="note"]')).toBeNull()
+    expect(panel.querySelector<HTMLDetailsElement>('.dshLiveTeamsMemberTechnical')?.open).toBe(false)
+  })
+  it('pauses assignments without invoking Session interruption and retains the revision guard', async () => {
+    const fetchCalls: Array<{ url: string; method: string; body?: string }> = []
+    const view = await renderView({ fetchCalls })
+    await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsMemberCollapsed')?.click() })
+    expect(view.querySelector('[data-member-section="availability"]')?.textContent).toContain('memberAvailabilityHint')
+    await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsAvailabilityAction')?.click() })
+    const mutation = fetchCalls.find(call => call.method === 'POST' && call.url.includes('/members/availability'))
+    expect(JSON.parse(mutation?.body ?? '{}')).toMatchObject({ memberId: 'm-1', availability: 'paused', expectedRevision: 3 })
+    expect(fetchCalls.some(call => call.url.includes('/member/interrupt'))).toBe(false)
+  })
+  it('updates Session/contact snapshots while keeping unsaved role and name drafts', async () => {
+    const payload: Parameters<typeof renderView>[0] = { pollMs: 25, snapshot: { ...snapshot, members: [{ ...snapshot.members[0], permittedContacts: ['human'] }] } }
+    const view = await renderView(payload)
+    await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsMemberCollapsed')?.click() })
+    const role = view.querySelector<HTMLSelectElement>('.dshLiveTeamsMemberPanel .dshLiveTeamsRoleInput')!
+    await act(async () => { Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set?.call(role, 'oracle'); role.dispatchEvent(new Event('change', { bubbles: true })); view.querySelector<HTMLButtonElement>('.dshLiveTeamsMemberPanel .dshLiveTeamsEditNameButton')?.click() })
+    const name = view.querySelector<HTMLInputElement>('.dshLiveTeamsMemberPanel .dshLiveTeamsNameInput')!
+    await act(async () => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(name, 'Unsaved name'); name.dispatchEvent(new Event('input', { bubbles: true })) })
+    payload.snapshot = { ...snapshot, revision: 4, members: [{ ...snapshot.members[0], status: 'idle', permittedContacts: ['team'] }] }
+    await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsOverviewActions .dshLiveTeamsIconButton')?.click(); await new Promise(resolve => setTimeout(resolve, 5)) })
+    expect(view.querySelector('.dshLiveTeamsMemberPanel .dshLiveTeamsStateLabel')?.textContent).toContain('idle')
+    expect(view.querySelector('.dshLiveTeamsContactChips')?.textContent).toContain('memberContactTeam')
+    expect(role.value).toBe('oracle')
+    expect(name.value).toBe('Unsaved name')
+  })
+})
+
+describe('task-first Team interactions', () => {  it('colors role icons from declared purpose, not display name or running state', async () => {
+    const fetchCalls: Array<{ url: string; method: string }> = []
+    const members = [
+      { ...snapshot.members[0], memberId: 'purpose-1', displayName: 'Lead in name only', role: 'builder', status: 'running' },
+      { ...snapshot.members[0], memberId: 'purpose-2', displayName: 'Builder in name only', role: 'lead', status: 'idle' },
+      { ...snapshot.members[0], memberId: 'purpose-3', displayName: 'Review', role: 'reviewer', status: 'unknown' },
+      { ...snapshot.members[0], memberId: 'purpose-4', displayName: 'Custom', role: 'project-custom', status: 'running' },
+    ]
+    const view = await renderView({ fetchCalls, snapshot: { ...snapshot, members }, tasks: { teamId: 'team-1', tasks: [] } })
+    const rows = Array.from(view.querySelectorAll('.dshLiveTeamsRow'))
+    expect(rows.map(row => row.querySelector('.dshLiveTeamsMemberAvatar')?.getAttribute('data-agent-role'))).toEqual(['builder', 'lead', 'reviewer', 'custom'])
+    expect(rows[0]?.querySelector('.dshLiveTeamsMemberLive')?.textContent).toContain('running')
+    expect(rows[1]?.querySelector('.dshLiveTeamsMemberLive')?.textContent).toContain('idle')
+    expect(rows[2]?.querySelector('.dshLiveTeamsMemberLive')?.textContent).toContain('unknown')
+    expect(fetchCalls.every(call => call.method === 'GET')).toBe(true)
+  })
+  it('explains an empty active filter when all known tasks are archived without switching filters or mutating data', async () => {
+    const fetchCalls: Array<{ url: string; method: string }> = []
+    const view = await renderView({ fetchCalls, tasks: { teamId: 'team-1', tasks: [{ ...taskFixture.tasks.tasks[0], status: 'completed', title: 'Closed evidence', archivedPath: '/archive/x' }] } })
+    expect(view.querySelector('.dshLiveTeamsTaskEmpty')?.textContent).toContain('tasksEmpty')
+    expect(view.querySelectorAll('.dshLiveTeamsTaskRow')).toHaveLength(0)
+    await act(async () => { view.querySelectorAll<HTMLButtonElement>('.dshLiveTeamsTaskFilterButton')[2]?.click() })
+    expect(view.querySelector('.dshLiveTeamsTaskEmpty')).toBeNull()
+    expect(view.querySelector('.dshLiveTeamsTaskRow')?.textContent).toContain('Closed evidence')
+    expect(fetchCalls.every(call => call.method === 'GET')).toBe(true)
+  })
+  it('keeps long typed references out of the activity heading but retains full source and emphasis on disclosure', async () => {
+    const title = 'Evidence task with long typed metadata '.repeat(12)
+    const summary = `Reviewer accepted · ${title}`
+    const view = await renderView({ journal: { teamId: 'team-1', entries: [{ id: 'long-row', kind: 'task/accepted', category: 'task', at: 1, summary, summaryParts: [{ text: 'Reviewer', strong: true }, { text: ` accepted · ${title}` }], refs: { taskTitle: title } }] } })
+    const row = view.querySelector('.dshLiveTeamsJournalRow')!
+    expect(row.querySelector('.dshLiveTeamsJournalSummary')?.textContent).toBe('Reviewer accepted')
+    expect(row.querySelector('.dshLiveTeamsJournalSummary strong')?.textContent).toBe('Reviewer')
+    expect(row.querySelector('.dshLiveTeamsJournalTaskRef')?.getAttribute('title')).toBe(title)
+    await act(async () => { row.querySelector<HTMLButtonElement>('.dshLiveTeamsJournalLine')?.click() })
+    expect(row.querySelector('.dshLiveTeamsJournalSourceSummary')?.textContent).toBe(summary)
+  })
+  it('avoids placeholder noise without inferring work from a live Session', async () => {
+    const view = await renderView({ tasks: { teamId: 'team-1', tasks: [] }, snapshot: { ...snapshot, members: [{ ...snapshot.members[0], note: undefined }] } })
+    const row = view.querySelector('.dshLiveTeamsRow')!
+    expect(row.textContent).not.toContain('noNote')
+    expect(row.textContent).toContain('noAssignedTask')
+    expect(row.querySelector('.dshLiveTeamsMemberLive')?.textContent).toContain('running')
+    expect(row.querySelector('svg')).not.toBeNull()
+  })
+  it('keeps a representative multi-member task-first view read-only and supports offline visual inspection', async () => {
+    const fetchCalls: Array<{ url: string; method: string }> = []
+    const names = ['Lead', 'Builder 1', 'Builder 2', 'Reviewer 1', 'Reviewer 2']
+    const members = names.map((displayName, index) => ({ ...snapshot.members[0], memberId: `m-${index + 1}`, displayName, role: index === 0 ? 'lead' : index < 3 ? 'builder' : 'reviewer', status: index === 0 || index === 2 ? 'running' : 'idle', permittedContacts: index === 0 ? ['m-2', 'm-3', 'm-4', 'm-5', 'team', 'human'] : ['m-1'], note: index === 0 ? 'Coordinates the existing contract' : undefined }))
+    const tasks = [
+      { ...taskFixture.tasks.tasks[0], id: 'layout-1', title: 'Preserve delivery semantics while improving the workspace team interface', status: 'in_progress', awaitsDecision: false, assigneeName: 'Builder 1', assignee: 'm-2' },
+      { ...taskFixture.tasks.tasks[0], id: 'layout-2', title: 'Verify responsive task details and keyboard access', status: 'ready', awaitsDecision: false, assigneeName: 'Builder 2', assignee: 'm-3' },
+      { ...taskFixture.tasks.tasks[0], id: 'layout-3', title: 'Review the submitted evidence without repeating acceptance', assigneeName: 'Builder 1', assignee: 'm-2', route: { type: 'review', reviewer: 'm-4', reviewerName: 'Reviewer 1' } },
+    ]
+    const { dictionaries } = await import('./locales.js')
+    const en = dictionaries.en
+    const view = await renderView({ fetchCalls, ctx: { t: (key: keyof typeof en) => en[key] }, roles: { ...roles, roles: [...roles.roles, { ...roles.roles[0], id: 'lead', name: 'Lead', description: 'Coordinates the team and maintains its operating order.' }, { ...roles.roles[0], id: 'reviewer', name: 'Reviewer', description: 'Reviews submitted work against the contract.' }] }, snapshot: { ...snapshot, members }, tasks: { teamId: 'team-1', tasks }, journal: { teamId: 'team-1', entries: [
+      { id: 'layout-j1', kind: 'task/submitted', category: 'task', at: 1700000010000, summary: 'Builder 1 submitted evidence for review', refs: { taskTitle: 'Review the submitted evidence', round: 1 } },
+      { id: 'layout-j2', kind: 'review/pass', category: 'review', at: 1700000009000, summary: 'Reviewer 2 recorded PASS; Lead notification is a separate delivery', refs: {} },
+      { id: 'layout-j3', kind: 'delivery/queued', category: 'delivery', at: 1700000008000, summary: 'Native admission is not execution', refs: {} },
+    ] } })
+    expect(view.querySelectorAll('.dshLiveTeamsRow')).toHaveLength(5)
+    expect(view.querySelectorAll('.dshLiveTeamsTaskRow')).toHaveLength(2)
+    if (process.env.LIVE_TEAMS_VISUAL_DIR !== undefined) {
+      const { mkdir, writeFile } = await import('node:fs/promises')
+      const { resolve } = await import('node:path')
+      const directory = resolve(process.env.LIVE_TEAMS_VISUAL_DIR)
+      if (!directory.startsWith('/tmp/team-ui-visual-')) throw new Error('visual output must be an owned temporary fixture')
+      await mkdir(directory, { recursive: true })
+      const { css } = await import('./styles.js')
+      const theme = ':root{--dsw-alias-label-primary:#e5e7eb;--dsw-alias-label-secondary:#a2a6af;--dsw-alias-label-tertiary:#777e89;--dsw-alias-bg-layer-1:#1b1d22;--dsw-alias-bg-layer-2:#21242a;--dsw-alias-border-l2:#343840;--dsw-alias-border-l1:#555c68;--dsw-alias-brand-primary:#7a9cfd;--dsw-alias-button-primary-fill:#537fe2;--dsw-alias-label-primary-foreground:#fff;--dsw-alias-interactive-bg-hover:#2d323b;--dsw-alias-state-error-primary:#e38786;--dsw-alias-state-warn-primary:#dab275;--dsw-alias-state-success-primary:#86bb9b}body{margin:0;background:#15171b;font-family:system-ui,sans-serif;height:100vh}body>main{height:100%;max-width:1200px;margin:auto}button,select,input,textarea{font-family:inherit}'
+      const save = async (name: string) => writeFile(`${directory}/${name}.html`, `<!doctype html><meta charset="utf-8"><title>Synthetic Team UI fixture — not the installed GUI</title><style>${theme}${css}</style><main>${view.innerHTML}</main>`)
+      await save('overview')
+      await act(async () => { view.querySelectorAll<HTMLButtonElement>('.dshLiveTeamsTaskFilterButton')[1]?.click() })
+      await save('waiting')
+      await act(async () => { view.querySelectorAll<HTMLButtonElement>('.dshLiveTeamsTaskFilterButton')[0]?.click() })
+      await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsMemberCollapsed')?.click() })
+      await save('member')
+      await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsMemberSettings .dshLiveTeamsEditNameButton')?.click() })
+      await save('member-edit')
+      await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsDrawerHeader button')?.click() })
+      await openSettings(view)
+      await save('settings')
+    }
+    expect(fetchCalls.every(call => call.method === 'GET')).toBe(true)
+  })
+  it('keeps settings hidden until requested and restores focus after Escape without a mutation', async () => {
+    const fetchCalls: Array<{ url: string; method: string }> = []
+    const view = await renderView({ fetchCalls })
+    const button = view.querySelector<HTMLButtonElement>('.dshLiveTeamsSettingsToggle')!
+    expect(view.querySelector('.dshLiveTeamsTeamControls')).toBeNull()
+    button.focus()
+    await openSettings(view)
+    const drawer = view.querySelector<HTMLElement>('.dshLiveTeamsDrawer')!
+    expect(drawer.getAttribute('aria-modal')).toBe('true')
+    expect(drawer.querySelector('.dshLiveTeamsLeadControl')).not.toBeNull()
+    expect(document.activeElement).toBe(drawer.querySelector('.dshLiveTeamsDrawerHeader button'))
+    await act(async () => { document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })) })
+    expect(view.querySelector('.dshLiveTeamsDrawer')).toBeNull()
+    expect(document.activeElement).toBe(button)
+    expect(fetchCalls.every(call => call.method === 'GET')).toBe(true)
+  })
+  it('traps member-panel keyboard focus, closes with Escape and preserves assignment truth', async () => {
+    const view = await renderView({ tasks: taskFixture.tasks })
+    const button = view.querySelector<HTMLButtonElement>('.dshLiveTeamsMemberCollapsed')!
+    expect(button.textContent).toContain('assignedTasks: Build report')
+    button.focus()
+    await act(async () => { button.click() })
+    const drawer = view.querySelector<HTMLElement>('.dshLiveTeamsDrawer')!
+    const close = drawer.querySelector<HTMLButtonElement>('.dshLiveTeamsDrawerHeader button')!
+    const last = drawer.querySelector<HTMLButtonElement>('.dshLiveTeamsMemberRemove')!
+    await act(async () => { close.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true })) })
+    expect(document.activeElement).toBe(last)
+    await act(async () => { last.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })) })
+    expect(document.activeElement).toBe(close)
+    await act(async () => { close.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })) })
+    expect(view.querySelector('.dshLiveTeamsMemberPanel')).toBeNull()
+    expect(document.activeElement).toBe(button)
+  })
+  it('keeps important failures visible, retains all technical events and discloses raw event kinds', async () => {
+    const fetchCalls: Array<{ url: string; method: string }> = []
+    const view = await renderView({ fetchCalls, journal: { teamId: 'team-1', entries: [
+      { id: 'j1', kind: 'task/created', category: 'task', at: 1, summary: 'Formal work saved', refs: {} },
+      { id: 'j2', kind: 'delivery/queued', category: 'delivery', at: 2, summary: 'Ordinary transport', refs: {} },
+      { id: 'j3', kind: 'delivery/failed', category: 'delivery', at: 3, summary: 'Actionable transport failure', refs: {} },
+    ] } })
+    const list = () => view.querySelector('.dshLiveTeamsJournalList')!
+    expect(list().textContent).toContain('Formal work saved')
+    expect(list().textContent).toContain('Actionable transport failure')
+    expect(list().textContent).not.toContain('Ordinary transport')
+    expect(list().textContent).not.toContain('task/created')
+    await act(async () => { Array.from(list().querySelectorAll<HTMLButtonElement>('.dshLiveTeamsJournalLine')).find(button => button.textContent?.includes('Formal work saved'))?.click() })
+    expect(list().textContent).toContain('task/created')
+    const mode = (text: string) => Array.from(view.querySelectorAll<HTMLButtonElement>('.dshLiveTeamsActivityModes button')).find(button => button.textContent === text)!
+    await act(async () => { mode('journalAll').click() })
+    expect(list().querySelectorAll('.dshLiveTeamsJournalRow')).toHaveLength(3)
+    await act(async () => { mode('journalTechnical').click() })
+    expect(list().textContent).not.toContain('Formal work saved')
+    expect(list().querySelectorAll('.dshLiveTeamsJournalRow')).toHaveLength(2)
+    expect(fetchCalls.every(call => call.method === 'GET')).toBe(true)
+  })
+})
+
+describe('journal read failure visibility', () => {
+  it('does not claim there is no activity when the initial journal response is invalid', async () => {
+    const view = await renderView({ journal: { teamId: 'team-1', entries: 'not-an-array' } })
+    const journal = view.querySelector('.dshLiveTeamsJournal')
+    expect(journal?.textContent).not.toContain('journalEmpty')
+    expect(journal?.querySelector('.dshLiveTeamsNotice')?.textContent).toContain('invalid team response')
+  })
+
+  it('retains good journal entries during a failed poll and clears the notice on recovery', async () => {
+    const payload: Parameters<typeof renderView>[0] = { pollMs: 25, journal: { teamId: 'team-1', entries: [{ id: 'e-1', kind: 'task/created', category: 'task', at: 1, summary: 'A stored task event', refs: {}, fields: [] }] } }
+    const view = await renderView(payload)
+    payload.journal = { teamId: 'team-1', entries: 'not-an-array' }
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 40)) })
+    const journal = view.querySelector('.dshLiveTeamsJournal')
+    expect(journal?.textContent).toContain('A stored task event')
+    expect(journal?.querySelector('.dshLiveTeamsNotice')?.textContent).toContain('invalid team response')
+    payload.journal = { teamId: 'team-1', entries: [] }
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 40)) })
+    expect(journal?.querySelector('.dshLiveTeamsNotice')).toBeNull()
+    expect(journal?.textContent).toContain('A stored task event')
+  })
+})
+
+describe('review return visibility', () => {
+  it.each([['failed', 'needs_human'], ['blocked', 'waiting']])('offers explicit return but not acceptance after %s', async (state, status) => {
+    const reviewReturn = { roundId: 'r1', submissionId: 'sub1', attemptId: 'attempt-1', generation: 1, assignee: 'm-1', sessionId: 's-1', bindingGeneration: 1, state, at: 1 }
+    const view = await renderView({ tasks: { teamId: 'team-1', tasks: [{ ...taskFixture.tasks.tasks[0], status, awaitsDecision: false, reviewReturn }] }, taskDetail: { ...taskFixture.detail, task: { ...taskFixture.detail.task, status, reviewReturn } } })
+    await act(async () => { view.querySelectorAll<HTMLButtonElement>('.dshLiveTeamsTaskFilterButton')[1]?.click(); })
+    await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsTaskSummary')?.click() })
+    const actions = Array.from(view.querySelectorAll<HTMLButtonElement>('.dshLiveTeamsTaskActions button')).map(button => button.textContent)
+    expect(actions).toContain('taskRevise')
+    expect(actions).not.toContain('taskAccept')
+  })
+  it.each(['pending', 'sending', 'delivered', 'started', 'completed', 'blocked', 'failed', 'unconfirmed', 'superseded'])('shows %s independently of the task progress badge', async state => {
+    const reviewReturn = { roundId: 'r1', submissionId: 'sub1', attemptId: 'attempt-1', generation: 1, assignee: 'm-1', sessionId: 's-1', bindingGeneration: 1, state, at: 1, messageId: 'msg1', requestId: 'req1', turn: 1, inputSeq: 2, leadNotified: false }
+    const view = await renderView({ tasks: { teamId: 'team-1', tasks: [{ ...taskFixture.tasks.tasks[0], status: 'in_progress', awaitsDecision: false, reviewReturn }] }, taskDetail: { ...taskFixture.detail, task: { ...taskFixture.detail.task, status: 'in_progress', reviewReturn } } })
+    expect(view.querySelector('[data-review-return-state]')?.textContent).toContain(`reviewReturn${state}`)
+    await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsTaskSummary')?.click() })
+    expect(view.querySelector('.dshLiveTeamsTaskDetail')?.textContent).toContain(`reviewReturn${state}`)
+    const text = view.querySelector('.dshLiveTeamsTaskDetail')?.textContent
+    if (['started', 'completed', 'blocked', 'failed'].includes(state)) expect(text).toContain('reviewReturnLeadPending')
+    else expect(text).not.toContain('reviewReturnLeadPending')
+  })
+})
+
+describe('repaired lifecycle controls', () => {
+  it.each([true, false])('shows the actual cancellation outcome (quiesced=%s)', async (quiesced) => {
+    const calls: Array<{ url: string; method: string; body?: string }> = []
+    const view = await renderView({ tasks: taskFixture.tasks, taskDetail: taskFixture.detail, taskQuiesced: quiesced, fetchCalls: calls })
+    await act(async () => { view.querySelectorAll<HTMLButtonElement>('.dshLiveTeamsTaskFilterButton')[1]?.click() })
+    await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsTaskSummary')?.click() })
+    const close = Array.from(view.querySelectorAll<HTMLButtonElement>('.dshLiveTeamsTaskActions button')).find((button) => button.textContent === 'taskClose')
+    expect(close).toBeDefined()
+    await act(async () => { close?.click() })
+    let submit = Array.from(view.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')).find((button) => button.textContent === 'taskClose')
+    expect(submit?.disabled).toBe(true)
+    const reason = view.querySelector<HTMLTextAreaElement>('[role="dialog"] textarea')
+    expect(reason).not.toBeNull()
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(reason, 'obsolete task')
+      reason?.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    submit = Array.from(view.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')).find((button) => button.textContent === 'taskClose')
+    expect(submit?.disabled).toBe(false)
+    await act(async () => { submit?.click() })
+    expect(calls.some((call) => call.url.includes('/task/cancel') && call.method === 'POST')).toBe(true)
+    expect(view.querySelector('[role="dialog"]')).toBeNull()
+    expect(view.textContent).not.toContain('invalid team response')
+    if (!quiesced) expect(view.textContent).toContain('taskStopUnconfirmed')
+  })
+
+  it('offers an explicit restart for parked work and sends the restart request', async () => {
+    const calls: Array<{ url: string; method: string; body?: string }> = []
+    const view = await renderView({ tasks: { teamId: 'team-1', tasks: [{ ...taskFixture.tasks.tasks[0], status: 'draft', awaitsDecision: false }] }, taskDetail: { ...taskFixture.detail, task: { ...taskFixture.detail.task, status: 'draft', activeAttemptId: undefined }, attempts: [{ ...taskFixture.detail.attempts[0], status: 'revoked' }] }, fetchCalls: calls })
+    await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsTaskSummary')?.click() })
+    const restart = Array.from(view.querySelectorAll<HTMLButtonElement>('.dshLiveTeamsTaskActions button')).find((button) => button.textContent === 'taskResume')
+    expect(restart).toBeDefined()
+    await act(async () => { restart?.click() })
+    expect(calls.some((call) => call.url.includes('/task/resume') && call.method === 'POST')).toBe(true)
+    expect(view.textContent).toContain('taskResumed')
+    expect(view.textContent).not.toContain('invalid team response')
+  })
+})
 
 describe('B29 dispatch surface', () => {
   const pausedDispatch = {
@@ -263,15 +562,18 @@ describe('B29 dispatch surface', () => {
   })
 
   it('gives the member panel an explicit way into the member Session', async () => {
-    const sessions = { list: [] as unknown[], open: vi.fn() }
-    const view = await renderView({ ctx: { sessions, t: (key: string) => key } })
+    // The panel asks for the behaviour, not for a service by name: the host moved session opening
+    // from `sessions.open` (0.1.5) to `uiWorkspace.openSession` (0.1.7), and a call to the wrong one
+    // throws inside a click handler, where no error boundary can catch it.
+    const openSession = vi.fn(() => true)
+    const view = await renderView({ ctx: { openSession, t: (key: string) => key } })
     const row = view.querySelector<HTMLElement>('.dshLiveTeamsRow')
     await act(async () => { row?.querySelector<HTMLElement>('.dshLiveTeamsMemberCollapsed')?.click() })
     const open = view.querySelector<HTMLButtonElement>('.dshLiveTeamsMemberOpen')
     expect(open?.textContent).toBe('openSessionAction')
     expect(open?.disabled).toBe(false)
     await act(async () => { open?.click() })
-    expect(sessions.open).toHaveBeenCalledWith('session-1')
+    expect(openSession).toHaveBeenCalledWith('session-1')
   })
 
   it('says why coding work is not started on its own', async () => {
@@ -359,7 +661,8 @@ describe('B23 task surface', () => {
     const view = await renderView({ tasks: taskFixture.tasks, taskDetail: taskFixture.detail })
     await act(async () => { view.querySelectorAll<HTMLButtonElement>('.dshLiveTeamsTaskFilterButton')[1]?.click() })
     const row = view.querySelector('.dshLiveTeamsTaskRow')
-    expect(row?.querySelector('.dshLiveTeamsTaskStatus')?.textContent).toContain('taskStatuswaiting')
+    expect(row?.querySelector('.dshLiveTeamsTaskStatus')?.textContent).toContain('taskAwaitingHuman')
+    expect(row?.querySelector('.dshLiveTeamsTaskStatus')?.getAttribute('title')).toBe('taskStatuswaiting')
     expect(row?.textContent).toContain('Build report')
     expect(row?.textContent).toContain('report → human')
     expect(row?.textContent).toContain('2/5')
@@ -427,6 +730,10 @@ describe('B23 task surface', () => {
     const save = Array.from(view.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')).at(-1)
     await act(async () => { save?.click() })
     expect(calls.some((call) => call.url.includes('/api/live-teams/task/create') && call.method === 'POST' && String(call.body).includes('From the panel'))).toBe(true)
+    expect(view.querySelector('[role="dialog"]')).toBeNull()
+    expect(view.textContent).toContain('taskSaved')
+    expect(view.textContent).toContain('taskPathNoMatch')
+    expect(view.textContent).toContain('packages/a/**')
 
     await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsTaskSummary')?.click() })
     const release = Array.from(view.querySelectorAll<HTMLButtonElement>('.dshLiveTeamsTaskActions button')).find((button) => button.textContent === 'taskRelease')
@@ -442,6 +749,9 @@ describe('B23 task surface', () => {
     const confirm = Array.from(view.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')).at(-1)
     await act(async () => { confirm?.click() })
     expect(calls.some((call) => call.url.includes('/api/live-teams/task/revoke') && String(call.body).includes('the human stopped it'))).toBe(true)
+    expect(view.querySelector('.dshLiveTeamsTaskDetail')).toBeNull()
+    await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsTaskSummary')?.click() })
+    expect(calls.filter((call) => call.url.includes('/api/live-teams/task?'))).toHaveLength(2)
   })
 
   it('renders the fixed round column and host chevron without nested actions', async () => {
@@ -504,13 +814,15 @@ describe('B23 task surface', () => {
     expect(view.querySelector('.dshLiveTeamsJournalList')?.textContent).toContain('sent hello')
   })
 
-  it('keeps compact cells free of controls and unfolds the selected member below the ribbon', async () => {
+  it('keeps compact cells free of mutation controls and opens selected-member management in a drawer', async () => {
     const view = await renderView()
     const row = view.querySelector<HTMLElement>('.dshLiveTeamsRow')
-    expect(row?.querySelectorAll('select, button')).toHaveLength(0)
+    expect(row?.querySelectorAll('select, input')).toHaveLength(0)
+    expect(row?.querySelectorAll('button')).toHaveLength(1)
+    expect(row?.querySelector('button')?.getAttribute('aria-haspopup')).toBe('dialog')
     expect(row?.textContent).toContain('Build')
-    expect(row?.textContent).toContain('builder')
-    expect(row?.textContent).toContain('available')
+    expect(row?.querySelector('.dshLiveTeamsMemberChip')?.textContent).toBe('Builder')
+    expect(row?.querySelector('button')?.title).toBe('available')
     expect(row?.textContent).toContain('implements')
     // The live marker is a real glyph: a literal "\u25cf" escape in the markup
     // renders as six visible characters and no structural test notices.
@@ -529,22 +841,22 @@ describe('B23 task surface', () => {
     expect(view.querySelector('.dshLiveTeamsMemberPanel .dshLiveTeamsNameInput')).not.toBeNull()
   })
 
-  it('lays the unfolded panel out as one header row plus one control row', async () => {
+  it('separates profile, role, assignments, contacts, Session, details and removal', async () => {
     const view = await renderView()
     await act(async () => { view.querySelector<HTMLElement>('.dshLiveTeamsMemberCollapsed')?.click() })
-    const panel = view.querySelector<HTMLElement>('.dshLiveTeamsMemberPanel')
-    const heading = panel?.querySelector<HTMLElement>('.dshLiveTeamsMemberHeading')
-    const identity = heading?.querySelector<HTMLElement>('.dshLiveTeamsMemberIdentity')
-    // Name, its edit affordance and the live state share the left of the header.
-    expect(identity?.querySelector('.dshLiveTeamsMemberName')?.textContent).toBe('Build')
-    expect(identity?.querySelector('.dshLiveTeamsEditNameButton')).not.toBeNull()
-    expect(identity?.querySelector('.dshLiveTeamsState')).not.toBeNull()
-    // Availability is a chip plus its toggle in the right corner, with no label:
-    // the chip already says what it is.
-    const actions = heading?.querySelector<HTMLElement>('.dshLiveTeamsMemberActions')
-    expect(actions?.querySelector('.dshLiveTeamsAvailabilityTag')).not.toBeNull()
-    expect(actions?.querySelector('.dshLiveTeamsIconButton')).not.toBeNull()
-    expect(panel?.textContent).not.toContain('availability')
+    const panel = view.querySelector<HTMLElement>('.dshLiveTeamsMemberSettings')!
+    expect(panel).toBeTruthy()
+    expect(Array.from(panel.querySelectorAll('[data-member-section]')).map(node => node.getAttribute('data-member-section'))).toEqual(['role', 'availability', 'contacts', 'session', 'note', 'technical', 'removal'])
+    const identity = panel.querySelector('.dshLiveTeamsMemberIdentity')!
+    expect(identity.querySelector('.dshLiveTeamsMemberName')?.textContent).toBe('Build')
+    expect(panel.querySelector('.dshLiveTeamsMemberHeading .dshLiveTeamsMemberAvatar')).not.toBeNull()
+    expect(identity.querySelector('.dshLiveTeamsEditNameButton')).not.toBeNull()
+    expect(identity.querySelector('.dshLiveTeamsState')).not.toBeNull()
+    expect(panel.querySelector('[data-member-section="availability"] .dshLiveTeamsAvailabilityAction')?.textContent).toContain('memberPauseAssignments')
+    expect(panel.querySelector('[data-member-section="session"] .dshLiveTeamsInterruptButton')).not.toBeNull()
+    expect(panel.querySelector('[data-member-section="session"] .dshLiveTeamsMemberOpen')).not.toBeNull()
+    expect(panel.querySelector<HTMLDetailsElement>('.dshLiveTeamsMemberTechnical')?.open).toBe(false)
+    expect(panel.querySelector('[data-member-section="removal"] .dshLiveTeamsMemberRemove')).not.toBeNull()
   })
 
   it('opens one member panel at a time so the ribbon never grows into a wall', async () => {
@@ -558,6 +870,7 @@ describe('B23 task surface', () => {
 
   it('collapses Briefing and Roles by default and expands each on demand', async () => {
     const view = await renderView()
+    await openSettings(view)
     expect(view.querySelector('.dshLiveTeamsBriefing')?.querySelector('pre')).toBeNull()
     expect(view.querySelector('.dshLiveTeamsRoles')?.querySelector('.dshLiveTeamsRoleRow')).toBeNull()
     await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsBriefing .dshLiveTeamsCollapseHeader')?.click(); view.querySelector<HTMLButtonElement>('.dshLiveTeamsRoles .dshLiveTeamsCollapseHeader')?.click() })
@@ -565,35 +878,23 @@ describe('B23 task surface', () => {
     expect(view.querySelector('.dshLiveTeamsRoles .dshLiveTeamsRoleRow')).not.toBeNull()
   })
 
-  it('uses the direct dsh-context shell instead of a flat full-width stack', async () => {
+  it('renders tasks first and full width, then compact members and activity, with settings hidden', async () => {
     const view = await renderView({ tasks: taskFixture.tasks })
-    const head = view.querySelector('.dshLiveTeamsHead')
-    const members = view.querySelector('.dshLiveTeamsMembers')
     const main = view.querySelector('.dshLiveTeamsMain')
-    expect(head?.querySelector('.dshLiveTeamsSummary')).not.toBeNull()
-    expect(head?.querySelector('.dshLiveTeamsTeamControls')).not.toBeNull()
-    expect(members).not.toBeNull()
-    expect(main?.querySelector('.dshLiveTeamsMainLeft .dshLiveTeamsJournal')).not.toBeNull()
-    // The inbox is a control in the journal header now, not a card of its own: the journal is what a
-    // person reads, and a second card took the height it needed.
-    expect(main?.querySelector('.dshLiveTeamsMainLeft .dshLiveTeamsJournal .dshLiveTeamsInboxButton')).not.toBeNull()
-    expect(main?.querySelector('.dshLiveTeamsMessages')).toBeNull()
-    expect(main?.querySelector('.dshLiveTeamsMainRight .dshLiveTeamsTasks')).not.toBeNull()
-    expect(view.querySelector('.dshLiveTeamsJournal .dshLiveTeamsCardTitle .dshLiveTeamsJournalFilters')).not.toBeNull()
-    expect(view.querySelector('.dshLiveTeamsTasks .dshLiveTeamsCardTitle .dshLiveTeamsTaskFilter')).not.toBeNull()
+    expect(Array.from(main?.children ?? []).map(node => node.className)).toEqual([
+      'dshLiveTeamsCard dshLiveTeamsTasks dshLiveTeamsListPanel',
+      'dshLiveTeamsCard dshLiveTeamsMembers',
+      'dshLiveTeamsCard dshLiveTeamsJournal',
+    ])
+    expect(view.querySelector('.dshLiveTeamsHead .dshLiveTeamsSummary')).not.toBeNull()
+    expect(view.querySelector('.dshLiveTeamsTeamControls')).toBeNull()
+    expect(view.querySelector('.dshLiveTeamsMainLeft, .dshLiveTeamsMainRight')).toBeNull()
+    expect(main?.querySelector('.dshLiveTeamsJournal .dshLiveTeamsInboxButton')).not.toBeNull()
+    expect(main?.querySelector('.dshLiveTeamsTasks .dshLiveTeamsTaskFilter')).not.toBeNull()
     const { css } = await import('./styles.js')
-    expect(css).toContain('min-width: min(360px, 100%)')
-    expect(css).toContain('flex: 1 1 150px')
-    expect(css).toContain('max-width: 190px')
-    expect(css).not.toContain('.dshLiveTeamsRowExpanded { grid-column: 1 / -1; }')
-    expect(css).toContain('.dshLiveTeamsRow[data-role="lead"]')
-    expect(css).toContain('var(--dsw-alias-state-error-primary)')
-    expect(css).toContain('.dshLiveTeamsRow[data-role="builder"]')
-    expect(css).toContain('.dshLiveTeamsMemberPanel {')
-    expect(css).toContain('.dshLiveTeamsMemberPanel[data-role="lead"]')
-    expect(css).not.toContain('details[open] > :not(summary)')
-    expect(css).toContain('background: var(--dsw-alias-button-primary-fill)')
-    expect(css).not.toMatch(/\.dshLiveTeamsPanelGrid > \.dshLiveTeamsJournal \{ width: 100%/u)
+    expect(css).toContain('.dshLiveTeamsTaskFirst .dshLiveTeamsMain { display: grid; grid-template-columns: minmax(0, 1fr);')
+    expect(css).toContain('.dshLiveTeamsDrawerBackdrop { position: fixed;')
+    expect(css).toContain('@container dshLiveTeamsCard (max-width: 700px)')
   })
 
   it('keeps the message composer behind the inbox control until requested', async () => {
@@ -612,6 +913,29 @@ describe('B23 task surface', () => {
     expect(dialog).not.toBeNull()
     expect(dialog?.querySelector('.dshLiveTeamsDialogBody .dshLiveTeamsInbox')).not.toBeNull()
     expect(dialog?.querySelector('.dshLiveTeamsDialogHead')).not.toBeNull()
+  })
+})
+
+describe('opening a member session survives the host moving the API', () => {
+  it('uses uiWorkspace.openSession when the host offers it', async () => {
+    // DSH 0.1.7 removed `sessions.open` and opens sessions through `uiWorkspace.openSession`;
+    // 0.1.5 is the other way round. The click used to throw inside the handler, where no error
+    // boundary can see it, so the button simply did nothing.
+    const opened: string[] = []
+    const view = await renderView({ ctx: { openSession: (id: string) => { opened.push(id); return true }, t: (key: string) => key } })
+    // The button lives in the expanded member panel, as the neighbouring test shows.
+    await act(async () => { view.querySelector<HTMLElement>('.dshLiveTeamsRow .dshLiveTeamsMemberCollapsed')?.click() })
+    const open = Array.from(view.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'openSessionAction')
+    await act(async () => { open?.click() })
+    expect(opened).toEqual(['session-1'])
+  })
+
+  it('says so when the host offers no way at all', async () => {
+    const view = await renderView({ ctx: { openSession: () => false, t: (key: string) => key } })
+    await act(async () => { view.querySelector<HTMLElement>('.dshLiveTeamsRow .dshLiveTeamsMemberCollapsed')?.click() })
+    const open = Array.from(view.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'openSessionAction')
+    await act(async () => { open?.click() })
+    expect(view.textContent).toContain('openSessionUnavailable')
   })
 })
 
@@ -690,6 +1014,44 @@ describe('add member session choice', () => {
     const rows = radioRows(view)
     expect(rows).toHaveLength(1)
     expect(rows[0]?.checked).toBe(true)
+  })
+})
+
+describe('adding a member does not wait for the candidate list', () => {
+  it('enables Create for a new Session while the candidate list is still loading', async () => {
+    // The list is for binding a Session that already exists. Waiting for it disabled the button for
+    // the new-Session path too, and a list that never arrives left the human with a dead button and
+    // no message — which is exactly what happened on the stand.
+    const payload: { candidatesNeverResolves?: boolean; fetchCalls?: Array<{ url: string; method: string }> } = { candidatesNeverResolves: true, fetchCalls: [] }
+    const view = await renderView(payload)
+    const add = Array.from(view.querySelectorAll<HTMLButtonElement>('button')).find((button) => (button.getAttribute('aria-label') ?? '') === 'addMember')
+    await act(async () => { add?.click() })
+    // The list never answers; the button for the new-Session path must be usable anyway. Asserting
+    // the loading text would only measure a microtask, and the point is the button.
+    // React tracks a controlled node's last value, so a plain assignment is swallowed as "no
+    // change": the native setter bypasses the tracker, as the neighbouring tests do it.
+    const setNative = (node: HTMLInputElement | HTMLSelectElement | null, value: string, event: 'input' | 'change'): void => {
+      if (node === null) return
+      const prototype = node instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype
+      Object.getOwnPropertyDescriptor(prototype, 'value')?.set?.call(node, value)
+      node.dispatchEvent(new Event(event, { bubbles: true }))
+    }
+    await act(async () => {
+      setNative(view.querySelector<HTMLInputElement>('input[type="text"]'), 'Panel Builder', 'input')
+      // The first select in the panel is the lead chooser; the role select lives in the dialog.
+      setNative(view.querySelector<HTMLSelectElement>('.dshLiveTeamsModalField select'), 'builder', 'change')
+    })
+    // The roles arrive from their own request: one more turn of the loop before judging the button.
+    await act(async () => { await Promise.resolve() })
+    const save = Array.from(view.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'createMember')
+    expect(save?.disabled).toBe(false)
+
+    // And the click does something even when the snapshot has not arrived: it fetches the revision it
+    // writes against instead of returning silently, which is what made the button look dead.
+    const calls = payload.fetchCalls ?? []
+    await act(async () => { save?.click() })
+    await act(async () => { await Promise.resolve() })
+    expect(calls.some((call) => call.url.includes('/api/live-teams/members') && call.method === 'POST')).toBe(true)
   })
 })
 
@@ -803,11 +1165,11 @@ describe('B18 contact policy UI', () => {
     }
     const lead = await openPanel('Lead')
     expect(lead?.querySelector('.dshLiveTeamsGrantControls')).not.toBeNull()
-    expect(lead?.querySelector('.dshLiveTeamsContactGrant')?.textContent).toContain('m-lead, human')
+    expect(Array.from(lead?.querySelectorAll('.dshLiveTeamsContactChip') ?? []).map(chip => chip.textContent)).toEqual(['Lead', 'memberContactHuman'])
     // The chooser is a styled field, not a bare select with browser chrome.
     expect(lead?.querySelector('.dshLiveTeamsContactSelect')?.className).toContain('dshLiveTeamsRoleInput')
     const worker = await openPanel('Worker')
-    expect(worker?.querySelector('.dshLiveTeamsContactGrant')?.textContent).toContain('m-lead, m-peer')
+    expect(Array.from(worker?.querySelectorAll('.dshLiveTeamsContactChip') ?? []).map(chip => chip.textContent)).toEqual(['Lead', 'Peer'])
     expect(worker?.querySelector('.dshLiveTeamsGrantControls')).toBeNull()
     const peer = await openPanel('Peer')
     expect(peer?.querySelector('.dshLiveTeamsGrantControls')).toBeNull()
@@ -870,6 +1232,7 @@ describe('B18 contact policy UI', () => {
 describe('B17 lead and briefing UI', () => {
   it('renders the Lead control, Briefing card text, and member note on its row', async () => {
     const view = await renderView()
+    await openSettings(view)
     expect(view.querySelector('.dshLiveTeamsLeadControl')).not.toBeNull()
     expect(view.textContent).toContain('Order text')
     expect(view.textContent).toContain('implements')
@@ -878,6 +1241,7 @@ describe('B17 lead and briefing UI', () => {
 
   it('disables opening the briefing when host capability is unavailable', async () => {
     const view = await renderView({ team: { enabled: true, teamId: 'team-1', teamName: 'B1 Check', workspacePath: '/w', revision: 3, memberCount: 1, briefing: 'Order text', openAvailable: false } })
+    await openSettings(view)
     const button = Array.from(view.querySelectorAll<HTMLButtonElement>('button')).find((entry) => entry.textContent === 'openBriefing')
     expect(button).not.toBeUndefined()
     expect(button?.disabled).toBe(true)
@@ -896,6 +1260,7 @@ describe('team mode', () => {
 
   it('shows the team name and the disable action when the team is on', async () => {
     const view = await renderView()
+    await openSettings(view)
     expect(view.textContent).toContain('B1 Check')
     expect(view.textContent).toContain('disableTeam')
     // The rename control is an icon button, so its name carries the meaning.
@@ -906,6 +1271,7 @@ describe('team mode', () => {
 describe('role panel', () => {
   it('renders one row per registry role and keeps every row', async () => {
     const view = await renderView()
+    await openSettings(view)
     await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsRoles .dshLiveTeamsCollapseHeader')?.click() })
     const rows = Array.from(view.querySelectorAll('.dshLiveTeamsRoleRow'))
     expect(rows).toHaveLength(roles.roles.length)
@@ -916,6 +1282,7 @@ describe('role panel', () => {
 
   it('offers customization for a global role and opening for a customized one', async () => {
     const view = await renderView()
+    await openSettings(view)
     await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsRoles .dshLiveTeamsCollapseHeader')?.click() })
     const rows = Array.from(view.querySelectorAll<HTMLElement>('.dshLiveTeamsRoleRow'))
     const customized = rows.find((row) => row.textContent?.includes('Builder'))
@@ -934,6 +1301,7 @@ describe('role panel', () => {
 
   it('names every action after its role, so the buttons are distinguishable', async () => {
     const view = await renderView()
+    await openSettings(view)
     await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsRoles .dshLiveTeamsCollapseHeader')?.click() })
     const labels = Array.from(view.querySelectorAll<HTMLElement>('.dshLiveTeamsRoleRow button')).map((button) => button.getAttribute('aria-label') ?? '')
     expect(labels).toHaveLength(2)
@@ -943,6 +1311,7 @@ describe('role panel', () => {
 
   it('renders the role panel inside the compact Team controls card', async () => {
     const view = await renderView()
+    await openSettings(view)
     const controls = view.querySelector('.dshLiveTeamsTeamControls')
     const panel = controls?.querySelector('.dshLiveTeamsRoles')
     expect(controls).not.toBeNull()
@@ -951,6 +1320,7 @@ describe('role panel', () => {
 
   it('renders no open action when the host cannot open paths', async () => {
     const view = await renderView({ roles: { ...roles, openAvailable: false, globalOpenAvailable: false } })
+    await openSettings(view)
     await act(async () => { view.querySelector<HTMLButtonElement>('.dshLiveTeamsRoles .dshLiveTeamsCollapseHeader')?.click() })
     const rows = Array.from(view.querySelectorAll<HTMLElement>('.dshLiveTeamsRoleRow'))
     expect(rows).toHaveLength(2)
@@ -1010,12 +1380,17 @@ describe('human messages composer and inbox', () => {
   })
 
   it('renders inbox rows with sender, kind and content once asked', async () => {
-    const view = await renderView({ messages: inboxWith('stored') })
+    const content = 'Проверка завершена: PASS.\n\n- `make check` — exit 0.\n- Два  пробела сохранены.\n\nПолные результаты — в вердикте.'
+    const inbox = inboxWith('stored')
+    inbox.messages[0]!.content = content
+    const view = await renderView({ messages: inbox })
     await expandInbox(view)
     const row = view.querySelector('.dshLiveTeamsInboxRow')
     expect(row?.textContent).toContain('Zed')
     expect(row?.textContent).toContain('Comment')
-    expect(row?.textContent).toContain('the review is ready')
+    expect(row?.querySelector('p')?.textContent).toBe(content)
+    const { css } = await import('./styles.js')
+    expect(css.match(/\.dshLiveTeamsInboxRow p\s*\{([^}]+)\}/)?.[1]).toContain('white-space: pre-wrap')
   })
 
   it('offers acknowledgement only while a row is unacknowledged', async () => {
@@ -1049,6 +1424,7 @@ describe('the lead survives a members refresh', () => {
 
   it('keeps the resolved lead after the snapshot is re-read', async () => {
     const view = await renderView({ snapshot: leadSnapshot, team: { enabled: true, teamId: 'team-1', teamName: 'B1 Check', workspacePath: '/w', revision: 3, memberCount: 2 } })
+    await openSettings(view)
     const select = (): HTMLSelectElement | null => view.querySelector<HTMLSelectElement>('.dshLiveTeamsLeadControl select')
     // The members snapshot carries no lead on the real server; the tab must take it
     // from the resolving route and must not clear it when members are refreshed.

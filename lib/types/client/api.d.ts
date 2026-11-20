@@ -1,3 +1,5 @@
+import { type ReviewReturn } from '../review-return-state.js';
+export type { ReviewReturn } from '../review-return-state.js';
 export type TeamMember = {
     memberId: string;
     note?: string;
@@ -167,6 +169,7 @@ export type TaskRouteSummary = {
     description: string;
 };
 export type TeamTask = {
+    reviewReturn?: ReviewReturn;
     id: string;
     teamId: string;
     title: string;
@@ -191,6 +194,7 @@ export type TeamTask = {
     documentMissing?: boolean;
 };
 export type TaskSummary = {
+    reviewReturn?: ReviewReturn;
     id: string;
     title: string;
     status: TaskStatus;
@@ -208,6 +212,8 @@ export type TaskSummary = {
         title: string;
         status: TaskStatus;
     }>;
+    /** A submission is in and nobody has decided on it. */
+    awaitsDecision?: boolean;
     /** Declared write paths, so the contract form can be filled without a second read. */
     paths?: string[];
     checks?: string[];
@@ -291,6 +297,16 @@ export type TeamTaskDetail = {
 export type AcceptTaskResult = {
     task: TeamTask;
     archivedPath: string;
+};
+export type CancelTaskResult = {
+    task: TeamTask;
+    archivedPath?: string;
+    quiesced: boolean;
+};
+export type PathWarning = {
+    code: 'path-no-match' | 'path-scan-incomplete';
+    pattern: string;
+    message: string;
 };
 export type ReviseTaskResult = {
     task: TeamTask;
@@ -398,6 +414,14 @@ export declare function setTeamDispatch(mode: 'auto' | 'paused', reason?: string
 }>;
 export declare function fetchTeamTask(taskId: string, session?: string, signal?: AbortSignal): Promise<TeamTaskDetail>;
 export declare function acceptTeamTask(taskId: string, note?: string, session?: string): Promise<AcceptTaskResult>;
+/**
+ * Close a task by hand, without a submission.
+ *
+ * Accept needs a submission awaiting a decision; a task whose work was done by hand, dropped, or
+ * overtaken has none, and the panel offered no way to close it.
+ */
+export declare function cancelTeamTask(taskId: string, reason: string, session?: string): Promise<CancelTaskResult>;
+export declare function resumeTeamTask(taskId: string, session?: string): Promise<ReviseTaskResult>;
 export declare function reviseTeamTask(taskId: string, instructions: string, session?: string): Promise<ReviseTaskResult>;
 export declare function fetchTeamRoles(session?: string, signal?: AbortSignal): Promise<TeamRoles>;
 export declare function openTeamRoles(kind: 'global' | 'workspace', id?: string, session?: string): Promise<string>;
@@ -471,11 +495,9 @@ export type TaskControlDraft = {
     roundLimit?: number;
 };
 export declare function createTeamTask(draft: TaskControlDraft, session?: string): Promise<{
-    task: {
-        id: string;
-        title: string;
-        status: string;
-    };
+    task: TeamTask;
+    documentPath: string;
+    warnings: PathWarning[];
 }>;
 export declare function updateTeamTask(request: {
     taskId: string;
@@ -486,11 +508,21 @@ export declare function updateTeamTask(request: {
     assignee?: string;
     body?: string;
     expectedRevision?: number;
-}, session?: string): Promise<MutationSuccess>;
+}, session?: string): Promise<{
+    task: TeamTask;
+    document: string;
+    changed: string[];
+    warnings: PathWarning[];
+}>;
 export declare function revokeTeamTask(request: {
     taskId: string;
     reason: string;
-}, session?: string): Promise<MutationSuccess>;
+}, session?: string): Promise<{
+    task: TeamTask;
+    attempt: TeamTaskAttempt;
+    quiesced: boolean;
+    reassigned: boolean;
+}>;
 export declare function addTeamMember(request: {
     sessionId: string;
     displayName: string;

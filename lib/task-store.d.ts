@@ -1,3 +1,6 @@
+import { PathWarning } from "./path-diagnostics.js";
+import { ReviewReturn } from "./review-return-state.js";
+import { LifecycleNoticeFence, LifecycleNoticeIntent, LifecycleNoticeRequest } from "./lifecycle-notice.js";
 import { Migration } from "./migrations.js";
 import { TeamState } from "./team-store.js";
 //#region src/task-store.d.ts
@@ -18,7 +21,21 @@ export type TaskRoute = {
 };
 /** The durable task shape deliberately leaves room for later Phase 4 fields. */
 export type HumanContact = 'none' | 'expected' | 'required';
+export interface ReviewReturnRequest {
+  taskId: string;
+  title: string;
+  leadMemberId: string;
+  leadSessionId?: string;
+  leadBindingGeneration?: number;
+  leadStillCurrent?: () => Promise<boolean>;
+  intent: ReviewReturn;
+  round: ReviewRound;
+  /** Recheck the attempt capability immediately before an external enqueue. */
+  stillCurrent: () => Promise<boolean>;
+}
 export interface TeamTask {
+  /** Prospective durable handoff only; historical reviews have no return intent. */
+  reviewReturn?: ReviewReturn;
   id: string;
   teamId: string;
   title: string;
@@ -81,6 +98,18 @@ export interface TeamTask {
     at: number;
     reportedAt?: number;
   };
+  /**
+   * A submission is in and nobody has decided on it: the lead or the human owes an accept or a
+   * return. Kept as a fact on the task rather than derived from the status, because the status also
+   * says `in_progress` after a return — and both the store and the panel read the status and
+   * concluded there was nothing to decide while a submission sat on the table (found on a real
+   * stand: the human had only "Release attempt" and the lead's accept was refused).
+   */
+  awaitsDecision?: boolean;
+  /** Prospective notification intent; mailbox/command rows retain the delivery receipt. */
+  submissionNoticeId?: string;
+  /** Prospective existing lifecycle handoffs; delivery records live in the mailbox outbox. */
+  lifecycleNotices?: LifecycleNoticeIntent[];
 }
 export interface TaskAttempt {
   id: string;
@@ -183,6 +212,7 @@ export type UpdateTaskResult = {
   readonly task: TeamTask;
   readonly document: string;
   readonly changed: readonly string[];
+  readonly warnings?: readonly PathWarning[];
 };
 /**
  * Take work away from its current attempt (B28).
@@ -374,6 +404,7 @@ export interface AcceptTaskRequest {
   note?: string;
 }
 export interface AcceptTaskResult {
+  notifications?: SubmissionNotificationReceipt[];
   task: TeamTask;
   archivedPath: string;
 }
@@ -383,6 +414,7 @@ export interface ReviseTaskRequest {
   instructions: string;
 }
 export interface ReviseTaskResult {
+  notifications?: SubmissionNotificationReceipt[];
   task: TeamTask;
 }
 export interface ReviewTaskRequest {
@@ -394,6 +426,7 @@ export interface ReviewTaskRequest {
   evidence?: readonly SubmissionCheck[];
 }
 export interface ReviewTaskResult {
+  notifications?: SubmissionNotificationReceipt[];
   round: ReviewRound;
   task: TeamTask;
 }
@@ -419,11 +452,35 @@ export interface ReadTaskResult {
 export interface CreateTaskResult {
   task: TeamTask;
   documentPath: string;
+  warnings?: readonly PathWarning[];
 }
 export interface ListTasksOptions {
   includeArchived?: boolean;
 }
+export type SubmissionNotificationReceipt = {
+  recipient?: string;
+  purpose: 'lead-acceptance' | 'review' | 'review-return' | 'review-return-lead' | LifecycleNoticeIntent['kind'];
+  state: 'queued' | 'pending' | 'failed' | 'unavailable' | 'superseded';
+  messageId?: string;
+  requestId?: string;
+  sessionId?: string;
+  bindingGeneration?: number;
+  reason?: string;
+};
+export type SubmissionNotificationRequest = {
+  taskId: string;
+  submissionId: string;
+  assignee: string;
+  summary: string;
+  recipient: string;
+  purpose: 'lead-acceptance' | 'review';
+  sessionId: string;
+  bindingGeneration: number;
+  stillCurrent: () => Promise<boolean>;
+};
 type TaskStoreOptions = {
+  deliverLifecycleNotice?: (request: LifecycleNoticeRequest) => Promise<SubmissionNotificationReceipt>;
+  deliverSubmissionNotice?: (request: SubmissionNotificationRequest) => Promise<SubmissionNotificationReceipt>;
   workspacePath: string;
   teamId: string;
   appendAudit?: (event: unknown) => Promise<void>;
@@ -441,11 +498,50 @@ type TaskStoreOptions = {
     taskId: string;
     note?: string;
   }) => Promise<void>;
+  /**
+   * Tell the reviewer that a submission is waiting.
+   *
+   * Handing the submission over is the member's job by contract, and a member that forgets leaves the
+   * work sitting: on a real stand one submission waited six and a half minutes for a human to notice,
+   * while the member that did message its reviewer was accepted in thirty-one seconds. The route is
+   * frozen in the task's contract once work starts, so this can only go where the lead sent it.
+   */
+  deliverReviewRequest?: (request: {
+    reviewer: string;
+    assignee: string;
+    taskId: string;
+    submissionId: string;
+    summary: string;
+  }) => Promise<void>;
+  /**
+   * Tell the assignee that the task was closed by hand.
+   *
+   * Closing ends the attempt, and a member whose Session is waiting for a next task is never told by
+   * the state change alone: acceptance has always delivered a closing message, and closing needs the
+   * same, with the reason.
+   */
+  deliverCancellation?: (request: {
+    assignee: string;
+    taskId: string;
+    reason: string;
+  }) => Promise<void>;
   deliverDirection?: (request: {
     assignee: string;
     taskId: string;
     instructions: string;
   }) => Promise<void>;
+  deliverReviewReturn?: (request: ReviewReturnRequest) => Promise<{
+    messageId: string;
+    requestId: string;
+    pending?: boolean;
+  }>;
+  observeReviewReturn?: (request: ReviewReturnRequest) => Promise<{
+    state: 'pending' | 'started' | 'completed' | 'failed' | 'unobservable';
+    turn?: number;
+    inputSeq?: number;
+    reason?: string;
+  }>;
+  notifyReviewReturn?: (request: ReviewReturnRequest) => Promise<SubmissionNotificationReceipt | void>;
   /**
    * Ask a Session to stop. Absent means the store cannot interrupt, and a
    * revocation then refuses rather than pretending the session was stopped.
@@ -460,6 +556,11 @@ type TaskStoreOptions = {
    * rather than as a clean result. The store never shells out itself.
    */
   changedPaths?: (workspacePath: string) => Promise<readonly string[] | undefined>;
+  /**
+   * What the member committed since the attempt's base. Optional: without it the scope sees the
+   * working tree only, which is the behaviour that refused a member who committed its work.
+   */
+  committedPaths?: (workspacePath: string, base: string) => Promise<readonly string[] | undefined>;
   /**
    * B32: which observation this workspace supports. Absent means the composition cannot
    * tell, and a scope record says `unchecked (unreadable)` rather than reading as clean.
@@ -515,6 +616,18 @@ export declare function blockedBy(task: Pick<TeamTask, 'dependsOn'>, tasks: read
 export declare function routeText(route: TaskRoute | undefined, team: TeamState): string;
 export declare function assignmentRouteText(route: TaskRoute | undefined, team: TeamState): string;
 export declare function deriveRouteContacts(task: TeamTask, team: TeamState): string[];
+/**
+ * Who a member may address, from one rule.
+ *
+ * Three places need this answer: the mailbox decides whether to deliver, the injected context tells
+ * the member who it may talk to, and the panel shows the same list. Each had its own copy, and the
+ * panel's was the narrowest — it showed the lead "contact with colleagues is not allowed" while the
+ * mailbox was happily delivering the lead's messages to everyone (found on a real stand).
+ *
+ * The rule itself: the lead may address every member; anyone else may address the lead, whoever a
+ * grant names, and whoever an active task's route opens — the same set the mailbox enforces.
+ */
+export declare function permittedContacts(state: TeamState, memberId: string, tasks: readonly TeamTask[]): string[];
 export declare function routeAllowsContact(task: TeamTask, from: string, to: string, team: TeamState): boolean;
 export declare function taskDocumentPath(workspacePath: string, teamId: string, taskId: string): string;
 declare function renderDocument(task: TeamTask, team: TeamState, fields?: {
@@ -529,11 +642,23 @@ export declare class TaskStore {
   private readonly appendAudit;
   private readonly deliverEscalation?;
   private readonly deliverClosing?;
+  private readonly deliverReviewRequest?;
+  private readonly deliverSubmissionNotice?;
+  private readonly deliverLifecycleNotice?;
+  private lifecycleCursor;
+  private submissionNoticeCursor;
+  private readonly deliverCancellation?;
   private readonly deliverDirection?;
+  private readonly deliverReviewReturn?;
+  private readonly observeReviewReturn?;
+  private readonly notifyReviewReturn?;
+  private readonly reviewReturnRuns;
+  private reviewReturnCursor;
   private readonly interruptSession?;
   private readonly awaitQuiescence?;
   private readonly quiescenceTimeoutMs;
   private readonly changedPaths;
+  private readonly committedPaths;
   private readonly git;
   private readonly migrations;
   private readonly workspaceMode;
@@ -549,6 +674,7 @@ export declare class TaskStore {
   readAttempts(): Promise<AttemptsState>;
   readSubmissions(): Promise<SubmissionsState>;
   readReviews(): Promise<ReviewsState>;
+  private ownedTaskForMember;
   activeTaskForMember(memberId: string): Promise<TeamTask | undefined>;
   activeTaskForMemberSync(memberId: string): TeamTask | undefined;
   /**
@@ -591,10 +717,52 @@ export declare class TaskStore {
   private contractRevisionLocked;
   submitTask(request: SubmitTaskRequest): Promise<{
     submission: Submission;
+    notifications: SubmissionNotificationReceipt[];
   }>;
+  private lifecycleSnapshot;
+  isLifecycleNoticeCurrent(fence: LifecycleNoticeFence): Promise<boolean>;
+  private processLifecycleNotification;
+  processLifecycleNotifications(taskId: string, kind: LifecycleNoticeIntent['kind']): Promise<SubmissionNotificationReceipt[]>;
+  recoverLifecycleNotifications(limit?: number): Promise<void>;
+  requestReviewNotification(taskId: string, roundId: string, actor: string): Promise<SubmissionNotificationReceipt[]>;
+  private submissionNotificationSnapshot;
+  isSubmissionNotificationCurrent(taskId: string, submissionId: string, recipient: string, purpose: string, sessionId?: string, bindingGeneration?: number): Promise<boolean>;
+  processSubmissionNotification(taskId: string): Promise<SubmissionNotificationReceipt[]>;
+  /** Recovery is opt-in per immutable submission, not a historical broadcast. */
+  recoverSubmissionNotifications(limit?: number): Promise<void>;
+  /** Explicit Lead/human-authorized repair for one existing immutable submission. */
+  requestSubmissionNotification(taskId: string, submissionId: string, actor: string): Promise<SubmissionNotificationReceipt[]>;
   acceptTask(request: AcceptTaskRequest): Promise<AcceptTaskResult>;
+  /**
+   * Close a task by hand, without a submission.
+   *
+   * The model always had a `cancelled` status and no way to reach it: accept needs a submission
+   * awaiting a decision, and a task whose work was done by hand, dropped, or overtaken has none. On a
+   * live stand a human closed three such tasks by editing their titles — the state never changed, and
+   * the panel offered only "Edit contract" and "Release attempt", neither of which closes anything.
+   */
+  cancelTask(request: {
+    taskId: string;
+    actor: string;
+    reason: string;
+    expectedRevision?: number;
+  }): Promise<{
+    task: TeamTask;
+    archivedPath?: string;
+    quiesced: boolean;
+    notifications?: SubmissionNotificationReceipt[];
+  }>;
   reviseTask(request: ReviseTaskRequest): Promise<ReviseTaskResult>;
   reviewTask(request: ReviewTaskRequest): Promise<ReviewTaskResult>;
+  isReviewReturnLeadCurrent(taskId: string, roundId: string, recipient: string, noticeClass: string | undefined, sessionId?: string, bindingGeneration?: number): Promise<boolean>;
+  private reviewReturnNotifications;
+  private reviewReturnBlockLocked;
+  isReviewReturnCurrent(taskId: string, identity: Pick<ReviewReturn, 'roundId' | 'submissionId' | 'attemptId' | 'generation' | 'assignee' | 'sessionId' | 'bindingGeneration'>): Promise<boolean>;
+  blockReviewReturn(taskId: string, identity: Pick<ReviewReturn, 'roundId' | 'submissionId' | 'attemptId' | 'generation' | 'assignee' | 'sessionId' | 'bindingGeneration'>, reason: 'human-intervened' | 'intervention-unobservable'): Promise<void>;
+  recoverReviewReturns(limit?: number): Promise<void>;
+  /** Recover only explicit prospective intents, never old terminal review records. */
+  processReviewReturn(taskId: string): Promise<void>;
+  private runReviewReturn;
   /**
    * What the declaration was worth at submission time. Only a writing task that
    * declared paths is checked: with nothing declared there is nothing to violate, and
@@ -704,6 +872,14 @@ export declare class TaskStore {
   revokeTask(request: RevokeTaskRequest): Promise<RevokeTaskResult>;
   /** Mark the settled outcome: revoked and re-owned, or escalated to the human. */
   private settleRevocation;
+  /** Explicitly release parked work; no attempt is minted until the normal claim path runs. */
+  resumeTask(request: {
+    taskId: string;
+    actor: string;
+    expectedRevision?: number;
+  }): Promise<{
+    task: TeamTask;
+  }>;
   acknowledgeTask(request: AcknowledgeTaskRequest): Promise<{
     task: TeamTask;
   }>;
@@ -726,4 +902,4 @@ export declare class TaskStore {
 }
 export declare function createTaskStore(options: TaskStoreOptions): TaskStore;
 //#endregion
-export { renderDocument };
+export { type ReviewReturn, renderDocument };

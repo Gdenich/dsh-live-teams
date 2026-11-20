@@ -131,6 +131,10 @@ export type DispatcherPorts = {
   taskStore: Pick<TaskStore, 'listTasks' | 'readAttempts' | 'claimTask' | 'markHumanIntervention' | 'closeTerminalAttempts' | 'pruneSnapshots' | 'markAttemptStalled' | 'reconcilePendingIntegrations'>;
   mailbox: Pick<MailboxService, 'listMessages' | 'listDeliveries' | 'sendFromScheduler' | 'retryExpiredLeases' | 'retryDelivery' | 'deliver' | 'healOrphanMessages'>;
   appendAudit: DispatchAudit;
+  recoverReviewReturns?: () => Promise<void>;
+  recoverSubmissionNotifications?: () => Promise<void>;
+  recoverLifecycleNotifications?: () => Promise<void>;
+  recoverObsoleteAssignments?: () => Promise<void>;
   /** Whether this deployment starts coding work on its own; `manual` by default. */
   codingDispatch?: CodingDispatch;
   /** Extra shared hotspots, on top of the built-in list. */

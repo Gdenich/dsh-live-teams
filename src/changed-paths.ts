@@ -34,6 +34,25 @@ export function parsePorcelainZ(stdout: string): string[] | undefined {
   return changed
 }
 
+/**
+ * What the member *committed* during its attempt.
+ *
+ * `git status` shows uncommitted work only, so a member that commits — which is what a careful
+ * engineer does, and what the repository's own conventions ask for — looked like it had changed
+ * nothing, and a report submission was refused with "nothing changed under the declaration" (found
+ * by a Builder on a real stand). The work is the union: what is still in the tree, and what was
+ * committed since the attempt took its base.
+ */
+export async function gitCommittedPaths(workspacePath: string, base: string): Promise<string[] | undefined> {
+  return await new Promise<string[] | undefined>((resolve) => {
+    execFile('git', ['-C', workspacePath, 'diff', '--name-only', '--no-renames', `${base}..HEAD`], { timeout: 5000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
+      if (error) { resolve(undefined); return }
+      const paths = stdout.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
+      resolve(paths.length > CHANGED_PATHS_LIMIT ? undefined : paths)
+    })
+  })
+}
+
 export async function gitChangedPaths(workspacePath: string): Promise<string[] | undefined> {
   return await new Promise<string[] | undefined>((resolve) => {
     execFile('git', ['-C', workspacePath, 'status', '--porcelain', '-z'], { timeout: 5000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {

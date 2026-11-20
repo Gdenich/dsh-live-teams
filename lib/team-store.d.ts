@@ -162,7 +162,14 @@ export declare class TeamStore {
   memberBySession(teamId: string, sessionId: string): Promise<MemberRecord | undefined>;
   bindSession(teamId: string, memberId: string, sessionId: string, expectedRevision: number): Promise<MemberRecord>;
   unbindSession(teamId: string, memberId: string, expectedRevision: number): Promise<MemberRecord>;
-  setLead(teamId: string, memberId: string, expectedRevision: number): Promise<TeamState>;
+  /**
+   * Name the lead, or clear the name.
+   *
+   * Clearing is a real operation, not an empty request: it returns the team to the fallback rule —
+   * whoever holds the `lead` role — which is what a team with one lead relies on anyway. The panel
+   * offered "Not set" and the server refused it with a 400, so the option did nothing.
+   */
+  setLead(teamId: string, memberId: string | undefined, expectedRevision: number): Promise<TeamState>;
   updateContactGrant(teamId: string, from: MemberId, to: ContactTarget, action: 'add' | 'remove', grantedBy: string): Promise<{
     state: TeamState;
     grants: ContactGrant[];

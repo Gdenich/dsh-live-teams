@@ -73,7 +73,35 @@ describe('B17 operating frame', () => {
     try { await mkdir(join(workspacePath, '.dsh-live-teams'), { recursive: true }); const tools: ToolDefinition[] = []; const binding = (sessionId: string) => ({ mailbox: {} as never, teamId: 'team', teamName: 'Team', member: current.members.find((entry) => entry.sessionId === sessionId)!, team: current, workspacePath, live: () => true, appendAudit: async (event: unknown) => { audit.push(event) } }); registerMemberTools({ register: (tool) => { tools.push(tool); return undefined } }, async (sessionId) => binding(sessionId), true); const brief = tools.find((tool) => tool.name === 'live_team_brief')!; const note = tools.find((tool) => tool.name === 'live_team_member_note')!; await expect(brief.execute({ action: 'update', text: 'x' }, execution('s-worker'))).rejects.toThrow(/briefing is owned by the lead/u); await expect(note.execute({ memberId: 'worker', note: 'x' }, execution('s-worker'))).rejects.toThrow(/briefing is owned by the lead/u); await brief.execute({ action: 'update', text: 'x' }, execution('s-lead')); await note.execute({ memberId: 'worker', note: 'does work' }, execution('s-lead')); expect(audit.filter((entry) => (entry as { kind?: string }).kind === 'briefing/updated')).toHaveLength(1); expect(audit.filter((entry) => (entry as { kind?: string }).kind === 'member/note')).toHaveLength(1) } finally { await rm(workspacePath, { recursive: true, force: true }) }
   })
   it('lead route sets lead, audits once, and refuses a stranger with 400', async () => {
-    const current = state(); const audit: unknown[] = []; const handlers = new Map<string, (request: never, response: LiveTeamsResponse) => unknown>(); const server: LiveTeamsWebServer = { port: 43120, register(route) { handlers.set(route.path, route.handler as never); return () => {} } }; registerLiveTeamsRoutes({ webServer: server }, { teamId: 'team', workspacePath: '/tmp', readState: async () => current, setLead: async (memberId) => { current.leadMemberId = memberId; return { state: current, leadMemberId: memberId } }, appendAudit: async (event) => { audit.push(event) } }); const handler = handlers.get(LIVE_TEAMS_TEAM_LEAD_ROUTE)!; const success = response(); await handler(request('POST', { sessionId: 's-worker', memberId: 'worker' }) as never, success); expect(success.statusCode).toBe(200); expect(audit).toHaveLength(1); const stranger = response(); await handler(request('POST', { sessionId: 's-worker', memberId: 'stranger' }) as never, stranger); expect(stranger.statusCode).toBe(400)
+    const current = state(); const audit: unknown[] = []; const handlers = new Map<string, (request: never, response: LiveTeamsResponse) => unknown>(); const server: LiveTeamsWebServer = { port: 43120, register(route) { handlers.set(route.path, route.handler as never); return () => {} } }; registerLiveTeamsRoutes({ webServer: server }, { teamId: 'team', workspacePath: '/tmp', readState: async () => current, setLead: async (memberId) => { if (memberId === undefined) delete current.leadMemberId; else current.leadMemberId = memberId; return { state: current, ...(memberId === undefined ? {} : { leadMemberId: memberId }) } }, appendAudit: async (event) => { audit.push(event) } }); const handler = handlers.get(LIVE_TEAMS_TEAM_LEAD_ROUTE)!; const success = response(); await handler(request('POST', { sessionId: 's-worker', memberId: 'worker' }) as never, success); expect(success.statusCode).toBe(200); expect(audit).toHaveLength(1); const stranger = response(); await handler(request('POST', { sessionId: 's-worker', memberId: 'stranger' }) as never, stranger); expect(stranger.statusCode).toBe(400)
+  })
+})
+
+describe('the context follows the route', () => {
+  const member = { memberId: 'm-lead', displayName: 'Lead', role: 'lead' as const, availability: 'available' as const, bindingGeneration: 1, contractRevision: 0 }
+
+  it('names the team tools without a prefix on a native route', () => {
+    const text = renderMembership(member, { teamId: 'team-1', route: 'deepseek-v4' })
+    expect(text).toContain('Your team tools: live_team_send')
+    expect(text).not.toContain('mcp__dsh__')
+    expect(text).not.toContain('ToolSearch')
+  })
+
+  it('names them as the oh-my-claude bridge does, and loads their schemas in one call', () => {
+    // On this route Claude Code hands the model tool names only, and a profile has about a hundred
+    // MCP tools, so a name it cannot place costs a turn.
+    const text = renderMembership(member, { teamId: 'team-1', route: 'claude-code/opus' })
+    expect(text).toContain('mcp__dsh__live_team_send')
+    expect(text).toContain('mcp__dsh__live_team_create_task')
+    expect(text).toContain('ToolSearch once with "select:mcp__dsh__live_team_send')
+    expect(text).toContain('Do not use the native Agent or SendMessage')
+    // A builder is told what it needs and nothing about leading.
+    const builder = renderMembership({ ...member, memberId: 'm-b', displayName: 'Builder', role: 'builder' }, { teamId: 'team-1', route: 'claude-code/opus' })
+    expect(builder).toContain('mcp__dsh__live_team_submit')
+    expect(builder).not.toContain('Do not use the native Agent')
+    // The list is the registry's list: every tool the role has, and no other.
+    for (const tool of toolsForRole('lead').mine) expect(text).toContain(`mcp__dsh__${tool}`)
+    for (const tool of toolsForRole('lead').notMine) expect(text).not.toContain(`ToolSearch once with "select:mcp__dsh__${tool}`)
   })
 })
 
@@ -95,5 +123,41 @@ describe('the context names the tools of the role', () => {
     // Every tool has exactly one home.
     const all = [...builder.mine, ...builder.notMine].sort()
     expect(all).toEqual([...MEMBER_TOOL_NAMES].sort())
+  })
+})
+
+describe('clearing the lead through the route', () => {
+  it('accepts the panel\'s "Not set" and records the clearing', async () => {
+    // The option existed in the panel and the server answered 400, so choosing it did nothing.
+    // The file's own valid state: readTeamState normalizes it, and a hand-made object fails that.
+    const current: TeamState = state()
+    const audit: { kind?: string; memberId?: string }[] = []
+    const handlers = new Map<string, (request: never, response: LiveTeamsResponse) => unknown>()
+    const server: LiveTeamsWebServer = { port: 43120, register(route) { handlers.set(route.path, route.handler as never); return () => {} } }
+    registerLiveTeamsRoutes({ webServer: server }, {
+      teamId: 'team',
+      workspacePath: '/tmp',
+      readState: async () => current,
+      setLead: async (memberId) => {
+        if (memberId === undefined) delete current.leadMemberId
+        else current.leadMemberId = memberId
+        return { state: current, ...(memberId === undefined ? {} : { leadMemberId: memberId }) }
+      },
+      appendAudit: async (event) => { audit.push(event as { kind?: string; memberId?: string }) },
+    })
+    const handler = handlers.get(LIVE_TEAMS_TEAM_LEAD_ROUTE)
+    expect(handler).toBeDefined()
+    const response = (): LiveTeamsResponse & { statusCode?: number; body?: unknown } => ({ statusCode: 0, setHeader() {}, end() {} })
+    // The shape the route reads: a pre-parsed `body`, as the other tests in this file use.
+    const request = (method: string, body: unknown) => ({
+      method, url: LIVE_TEAMS_TEAM_LEAD_ROUTE, headers: { host: '127.0.0.1:43120', 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+      socket: { remoteAddress: '127.0.0.1' }, body: JSON.stringify(body),
+    })
+    const cleared = response()
+    await handler?.(request('POST', { sessionId: 's-worker', memberId: '' }) as never, cleared as never)
+    expect(cleared.statusCode, JSON.stringify(cleared.body)).toBe(200)
+    expect(current.leadMemberId).toBeUndefined()
+    expect(audit.at(-1)?.kind).toBe('team/lead-cleared')
+    expect(audit.at(-1)?.memberId).toBeUndefined()
   })
 })

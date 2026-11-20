@@ -14,7 +14,7 @@ import {
   type LiveTeamsWebServer,
 } from './routes.js'
 import { ERROR_CODES, LiveTeamsError } from './errors.js'
-import { TeamStore, type TeamState } from './team-store.js'
+import { TeamStore, resolveLeadMemberId, type TeamState } from './team-store.js'
 import { TaskStore } from './task-store.js'
 
 const headers = { host: '127.0.0.1:43120', 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' }
@@ -391,6 +391,52 @@ describe('reserved actor names (impersonation)', () => {
       // An ordinary member still goes through.
       const ok = await store.commit('team-1', { expectedRevision: opened.revision, mutate: (state) => { state.members.push({ memberId: 'm-worker', displayName: 'Worker', role: 'builder', availability: 'available', bindingGeneration: 1, contractRevision: 0 } as never) } })
       expect(ok.state.members).toHaveLength(1)
+    } finally { await rm(workspace, { recursive: true, force: true }) }
+  })
+})
+
+describe('naming and clearing the lead', () => {
+  it('clears the name and leaves the team on the role rule', async () => {
+    // The panel offered "Not set" and the server answered 400, so the option did nothing at all.
+    // Clearing is a real operation: it returns the team to the rule a one-lead team relies on anyway.
+    const workspace = await mkdtemp(join(tmpdir(), 'live-teams-lead-'))
+    try {
+      const store = new TeamStore({ workspacePath: workspace, workspaceId: 'ws', teamId: 'team-1' })
+      await store.open()
+      const opened = await store.open()
+      await store.commit('team-1', {
+        expectedRevision: opened.revision,
+        mutate: (state) => {
+          state.members.push(
+            { memberId: 'm-lead', displayName: 'Lead', role: 'lead', availability: 'available', bindingGeneration: 1, contractRevision: 0 },
+            { memberId: 'm-worker', displayName: 'Builder', role: 'builder', availability: 'available', bindingGeneration: 1, contractRevision: 0 },
+          )
+        },
+      })
+      const named = await store.setLead('team-1', 'm-lead', (await store.open()).revision)
+      expect(named.leadMemberId).toBe('m-lead')
+      const cleared = await store.setLead('team-1', undefined, named.revision)
+      expect(cleared.leadMemberId).toBeUndefined()
+      expect(resolveLeadMemberId(cleared)).toBe('m-lead')
+    } finally { await rm(workspace, { recursive: true, force: true }) }
+  })
+})
+
+describe('the state root ignores itself', () => {
+  it('leaves a .gitignore behind, and does not touch one that exists', async () => {
+    // The directory lives in the user's project: whether it shows up as untracked depends on that
+    // project's .gitignore, which is not ours to edit. A marker inside makes `git add -A` safe
+    // everywhere, the way `.git/` is.
+    const workspace = await mkdtemp(join(tmpdir(), 'live-teams-ignore-'))
+    try {
+      const store = new TeamStore({ workspacePath: workspace, workspaceId: 'ws', teamId: 'team-1' })
+      await store.open()
+      const marker = join(workspace, '.dsh-live-teams', '.gitignore')
+      expect(await readFile(marker, 'utf8')).toContain('*')
+      // A project that wrote its own file keeps it.
+      await writeFile(marker, 'mine\n')
+      await store.open()
+      expect(await readFile(marker, 'utf8')).toBe('mine\n')
     } finally { await rm(workspace, { recursive: true, force: true }) }
   })
 })

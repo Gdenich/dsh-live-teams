@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -61,10 +61,76 @@ async function mailboxOf(options: {
     ...(options.leaseMs === undefined ? {} : { leaseMs: options.leaseMs }),
     ...(options.autoDeliver === undefined ? {} : { autoDeliver: options.autoDeliver }),
   })
-  return { workspacePath, mailbox, calls }
+  return { workspacePath, mailbox, calls, queue }
 }
 
 const message = (overrides: Partial<MessageDraft> = {}): MessageDraft => ({ to: 'm-1', kind: 'message', content: 'hello', ...overrides })
+
+describe('quiet broadcast and concurrent delivery', () => {
+  it('allows the original delivery to finish while concurrent calls return a pending receipt', async () => {
+    let release!: () => void; let entered!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const ready = new Promise<void>(resolve => { entered = resolve })
+    let admitted: TestCommand | undefined
+    const f = await mailboxOf({ autoDeliver: false, admit: async request => { admitted = command('held-command', request); return { record: admitted, duplicate: false } }, dispatch: async () => { entered(); await gate; return admitted! } })
+    try {
+      const sent = await f.mailbox.sendFromHuman(message())
+      const first = f.mailbox.deliver(sent.deliveries[0]!.id)
+      await ready
+      expect((await f.mailbox.deliver(sent.deliveries[0]!.id)).state).toBe('leased')
+      expect((await f.mailbox.retryDelivery(sent.deliveries[0]!.id)).state).toBe('leased')
+      release()
+      expect((await first).state).toBe('delivered')
+      expect((await f.mailbox.listDeliveries())[0]?.revision).toBe(3)
+    } finally { release(); await cleanup(f.workspacePath) }
+  })
+  it('broadcasts to active peers but not the authenticated sender', async () => {
+    const f = await mailboxOf({ recipients: [{ memberId: 'm-1', sessionId: 's-1', bindingGeneration: 1 }, { memberId: 'm-2', sessionId: 's-2', bindingGeneration: 1 }, { memberId: 'm-3', active: false }] })
+    try {
+      const result = await f.mailbox.sendFromSession('s-1', message({ to: 'team' }))
+      expect(result.deliveries.map(row => row.recipient)).toEqual(['m-2'])
+      expect(f.calls.map(call => call.sessionId)).toEqual(['s-2'])
+      const self = await f.mailbox.sendFromSession('s-1', message())
+      expect(self.deliveries[0]?.recipient).toBe('m-1')
+    } finally { await cleanup(f.workspacePath) }
+  })
+  it('does not create an orphan or self echo when a sender is the only active member', async () => {
+    const f = await mailboxOf()
+    try {
+      await expect(f.mailbox.sendFromSession('s-1', message({ to: 'team' }))).rejects.toThrow('no other active recipients')
+      expect(await f.mailbox.listMessages()).toHaveLength(0)
+      expect(f.calls).toHaveLength(0)
+    } finally { await cleanup(f.workspacePath) }
+  })
+  it('returns an active lease as delivery in progress without admitting a second command', async () => {
+    const f = await mailboxOf({ autoDeliver: false })
+    try {
+      const sent = await f.mailbox.sendFromHuman(message())
+      await f.mailbox.claimDelivery(sent.deliveries[0]!.id)
+      await expect(f.mailbox.deliver(sent.deliveries[0]!.id)).resolves.toMatchObject({ state: 'leased' })
+      expect(f.calls).toHaveLength(0)
+    } finally { await cleanup(f.workspacePath) }
+  })
+})
+
+describe('message text is not compressed by delivery', () => {
+  it('preserves Russian prose, code identifiers, spaces and multiline Markdown', async () => {
+    const content = 'Раунд 2: PASS с замечаниями.\n\n- Проверка `make check` завершилась: exit 0.\n- Неблокирующее замечание — поле `created_by`.\n\nПолный разбор — в вердикте; слова  с  двумя пробелами сохранены.'
+    let queued: readonly unknown[] = []
+    let admitted: TestCommand | undefined
+    const value = await mailboxOf({
+      admit: async (request) => { queued = request.content; admitted = command('unicode-message', request); return { record: admitted, duplicate: false } },
+      dispatch: async () => { if (admitted === undefined) throw new Error('not admitted'); return admitted },
+    })
+    try {
+      const sent = await value.mailbox.sendFromSession('s-1', message({ content }))
+      expect((await value.mailbox.getMessage(sent.message.id))?.content).toBe(content)
+      expect(queued).toEqual([{ type: 'text', text: `Peer message from Builder (message): ${content}` }])
+      const reopened = JSON.parse(await readFile(join(value.workspacePath, '.dsh-live-teams', 'teams', 'team-1', 'messages.json'), 'utf8')) as { messages: Array<{ content: string }> }
+      expect(reopened.messages[0]?.content).toBe(content)
+    } finally { await rm(value.workspacePath, { recursive: true, force: true }) }
+  })
+})
 
 describe('B16.1 delivery outcomes', () => {
   const cases: Array<[MessageDeliveryState, MessageWakePolicy, string]> = [
@@ -103,6 +169,45 @@ describe('B16.1 delivery outcomes', () => {
     expect(messageDeliveryOutcome(result.deliveries[0]!)).toBe('inbox')
   })
 
+})
+
+async function cleanup(workspace: string): Promise<void> {
+  const target = await realpath(workspace)
+  if (!target.startsWith(join(await realpath(tmpdir()), 'live-teams-mailbox-'))) throw new Error('unexpected mailbox fixture cleanup target')
+  await rm(target, { recursive: true, force: true })
+}
+
+describe('scheduler outbox idempotency', () => {
+  it('rechecks delivery authority when a stored notification is retried in the background', async () => {
+    const f = await mailboxOf({ autoDeliver: false })
+    try {
+      const sent = await f.mailbox.sendFromSchedulerOnce({ to: 'm-1', kind: 'message', content: 'Correction', threadId: 'guarded' })
+      const reopened = createMailbox({ workspacePath: f.workspacePath, teamId: 'team-1', queue: f.queue, listRecipients: async () => [{ memberId: 'm-1', sessionId: 's-1', bindingGeneration: 1 }], canDeliver: async () => false })
+      expect((await reopened.deliver(sent.deliveries[0]!.id)).state).toBe('failed')
+      expect(f.calls).toHaveLength(0)
+    } finally { await cleanup(f.workspacePath) }
+  })
+  it('atomically deduplicates a scheduler thread and reuses it after reopening the mailbox', async () => {
+    const f = await mailboxOf()
+    try {
+      const draft: MessageDraft = { to: 'm-1', kind: 'message', content: 'One correction request', threadId: 'review-return-test' }
+      const results = await Promise.all(Array.from({ length: 8 }, () => f.mailbox.sendFromSchedulerOnce(draft)))
+      expect(new Set(results.map(result => result.message.id)).size).toBe(1)
+      expect(await f.mailbox.listMessages()).toHaveLength(1)
+      expect(f.calls).toHaveLength(1)
+      const reopened = createMailbox({ workspacePath: f.workspacePath, teamId: 'team-1', queue: f.queue, listRecipients: async () => [{ memberId: 'm-1', sessionId: 's-1', bindingGeneration: 1, active: true }] })
+      expect((await reopened.sendFromSchedulerOnce(draft)).message.id).toBe(results[0]!.message.id)
+      expect(f.calls).toHaveLength(1)
+    } finally { await cleanup(f.workspacePath) }
+  })
+  it('refuses reuse of a scheduler identity for changed content', async () => {
+    const f = await mailboxOf({ autoDeliver: false })
+    try {
+      await f.mailbox.sendFromSchedulerOnce({ to: 'm-1', kind: 'message', content: 'First', threadId: 'same-key' })
+      await expect(f.mailbox.sendFromSchedulerOnce({ to: 'm-1', kind: 'message', content: 'Changed', threadId: 'same-key' })).rejects.toThrow()
+      expect(await f.mailbox.listMessages()).toHaveLength(1)
+    } finally { await cleanup(f.workspacePath) }
+  })
 })
 
 describe('B12 durable mailbox', () => {

@@ -2,7 +2,8 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { LIVE_TEAMS_JOURNAL_ROUTE, LIVE_TEAMS_MEMBER_GRANT_ROUTE, LIVE_TEAMS_MESSAGES_ROUTE, LIVE_TEAMS_MESSAGES_ACKNOWLEDGE_ROUTE, LIVE_TEAMS_ATTENTION_ROUTE, LIVE_TEAMS_CANDIDATES_ROUTE, LIVE_TEAMS_MEMBER_AVAILABILITY_ROUTE, LIVE_TEAMS_MEMBER_CREATE_SESSION_ROUTE, LIVE_TEAMS_MEMBER_INTERRUPT_ROUTE, LIVE_TEAMS_MEMBER_NAME_ROUTE, LIVE_TEAMS_MEMBER_REMOVE_ROUTE, LIVE_TEAMS_MEMBER_ROLE_ROUTE, LIVE_TEAMS_TASKS_ROUTE, LIVE_TEAMS_TASK_ROUTE, LIVE_TEAMS_TASK_ACCEPT_ROUTE, LIVE_TEAMS_TASK_REVISE_ROUTE, liveTeamsRequestAllowed, projectLiveTeamsCandidates, projectLiveTeamsSnapshot, registerLiveTeamsRoutes, type LiveTeamsCreateMemberRequest, type LiveTeamsCreateMemberResult, type LiveTeamsCreateSessionMemberRequest, type LiveTeamsCreateSessionMemberResult, type LiveTeamsMutation, type LiveTeamsMutationResult, type LiveTeamsResponse, type LiveTeamsWebServer, LIVE_TEAMS_TASK_CREATE_ROUTE, LIVE_TEAMS_TASK_UPDATE_ROUTE, LIVE_TEAMS_TASK_REVOKE_ROUTE } from './routes.js'
+import { permittedContacts } from './task-store.js'
+import { LIVE_TEAMS_JOURNAL_ROUTE, LIVE_TEAMS_MEMBER_GRANT_ROUTE, LIVE_TEAMS_MESSAGES_ROUTE, LIVE_TEAMS_MESSAGES_ACKNOWLEDGE_ROUTE, LIVE_TEAMS_ATTENTION_ROUTE, LIVE_TEAMS_CANDIDATES_ROUTE, LIVE_TEAMS_MEMBER_AVAILABILITY_ROUTE, LIVE_TEAMS_MEMBER_CREATE_SESSION_ROUTE, LIVE_TEAMS_MEMBER_INTERRUPT_ROUTE, LIVE_TEAMS_MEMBER_NAME_ROUTE, LIVE_TEAMS_MEMBER_REMOVE_ROUTE, LIVE_TEAMS_MEMBER_ROLE_ROUTE, LIVE_TEAMS_TASKS_ROUTE, LIVE_TEAMS_TASK_ROUTE, LIVE_TEAMS_TASK_ACCEPT_ROUTE, LIVE_TEAMS_TASK_NOTIFY_SUBMISSION_ROUTE, LIVE_TEAMS_TASK_NOTIFY_REVIEW_ROUTE, LIVE_TEAMS_TASK_REVISE_ROUTE, liveTeamsRequestAllowed, projectLiveTeamsCandidates, projectLiveTeamsSnapshot, registerLiveTeamsRoutes, type LiveTeamsCreateMemberRequest, type LiveTeamsCreateMemberResult, type LiveTeamsCreateSessionMemberRequest, type LiveTeamsCreateSessionMemberResult, type LiveTeamsMutation, type LiveTeamsMutationResult, type LiveTeamsResponse, type LiveTeamsWebServer, LIVE_TEAMS_TASK_CREATE_ROUTE, LIVE_TEAMS_TASK_UPDATE_ROUTE, LIVE_TEAMS_TASK_REVOKE_ROUTE } from './routes.js'
 import { ERROR_CODES, LiveTeamsError } from './errors.js'
 import { TeamStore, type TeamState } from './team-store.js'
 import { createTaskStore, type ReadTaskResult, type TaskStore, type TeamTask } from './task-store.js'
@@ -48,7 +49,7 @@ function routeOf(readState: () => Promise<unknown>, agents: { get: (id: string) 
   const dispose = registerLiveTeamsRoutes({ webServer: server }, { teamId: 'team-1', workspacePath, readState, agents, ...extra })
   const handler = handlers.get('/api/live-teams/members')
   if (handler === undefined) throw new Error('handler was not registered')
-  return { taskCreate: handlers.get(LIVE_TEAMS_TASK_CREATE_ROUTE), taskUpdate: handlers.get(LIVE_TEAMS_TASK_UPDATE_ROUTE), taskRevoke: handlers.get(LIVE_TEAMS_TASK_REVOKE_ROUTE), handler, journal: handlers.get(LIVE_TEAMS_JOURNAL_ROUTE), grant: handlers.get(LIVE_TEAMS_MEMBER_GRANT_ROUTE), messages: handlers.get(LIVE_TEAMS_MESSAGES_ROUTE), attention: handlers.get(LIVE_TEAMS_ATTENTION_ROUTE), acknowledge: handlers.get(LIVE_TEAMS_MESSAGES_ACKNOWLEDGE_ROUTE), candidates: handlers.get(LIVE_TEAMS_CANDIDATES_ROUTE), createSession: handlers.get(LIVE_TEAMS_MEMBER_CREATE_SESSION_ROUTE), interrupt: handlers.get(LIVE_TEAMS_MEMBER_INTERRUPT_ROUTE), role: handlers.get(LIVE_TEAMS_MEMBER_ROLE_ROUTE), availability: handlers.get(LIVE_TEAMS_MEMBER_AVAILABILITY_ROUTE), name: handlers.get(LIVE_TEAMS_MEMBER_NAME_ROUTE), remove: handlers.get(LIVE_TEAMS_MEMBER_REMOVE_ROUTE), tasks: handlers.get(LIVE_TEAMS_TASKS_ROUTE), task: handlers.get(LIVE_TEAMS_TASK_ROUTE), accept: handlers.get(LIVE_TEAMS_TASK_ACCEPT_ROUTE), revise: handlers.get(LIVE_TEAMS_TASK_REVISE_ROUTE), unregister: dispose }
+  return { notifyReview: handlers.get(LIVE_TEAMS_TASK_NOTIFY_REVIEW_ROUTE), notifySubmission: handlers.get(LIVE_TEAMS_TASK_NOTIFY_SUBMISSION_ROUTE), taskCreate: handlers.get(LIVE_TEAMS_TASK_CREATE_ROUTE), taskUpdate: handlers.get(LIVE_TEAMS_TASK_UPDATE_ROUTE), taskRevoke: handlers.get(LIVE_TEAMS_TASK_REVOKE_ROUTE), handler, journal: handlers.get(LIVE_TEAMS_JOURNAL_ROUTE), grant: handlers.get(LIVE_TEAMS_MEMBER_GRANT_ROUTE), messages: handlers.get(LIVE_TEAMS_MESSAGES_ROUTE), attention: handlers.get(LIVE_TEAMS_ATTENTION_ROUTE), acknowledge: handlers.get(LIVE_TEAMS_MESSAGES_ACKNOWLEDGE_ROUTE), candidates: handlers.get(LIVE_TEAMS_CANDIDATES_ROUTE), createSession: handlers.get(LIVE_TEAMS_MEMBER_CREATE_SESSION_ROUTE), interrupt: handlers.get(LIVE_TEAMS_MEMBER_INTERRUPT_ROUTE), role: handlers.get(LIVE_TEAMS_MEMBER_ROLE_ROUTE), availability: handlers.get(LIVE_TEAMS_MEMBER_AVAILABILITY_ROUTE), name: handlers.get(LIVE_TEAMS_MEMBER_NAME_ROUTE), remove: handlers.get(LIVE_TEAMS_MEMBER_REMOVE_ROUTE), tasks: handlers.get(LIVE_TEAMS_TASKS_ROUTE), task: handlers.get(LIVE_TEAMS_TASK_ROUTE), accept: handlers.get(LIVE_TEAMS_TASK_ACCEPT_ROUTE), revise: handlers.get(LIVE_TEAMS_TASK_REVISE_ROUTE), unregister: dispose }
 }
 
 // The panel's own request: same-origin evidence, so the mutation is attributed to the human. A
@@ -59,11 +60,49 @@ const plainHeaders = { host: '127.0.0.1:43120', 'sec-fetch-site': 'same-origin',
 const authorized = { method: 'GET', headers: { host: '127.0.0.1:43120', 'sec-fetch-site': 'same-origin' }, socket: { remoteAddress: '127.0.0.1' } }
 
 describe('B23 task routes', () => {
+  it('repairs only one explicit verdict handoff without repeating review or acceptance', async () => {
+    const requestReviewNotification = vi.fn(async () => [{ recipient: 'lead', purpose: 'review-verdict', state: 'queued', messageId: 'm1', requestId: 'q1' }])
+    const routes = routeOf(async () => baseState, undefined, { taskStore: { requestReviewNotification } as unknown as TaskStore })
+    for (const [body, status] of [[{ taskId: 't1', sessionId: 's-live' }, 400], [{ taskId: 't1', roundId: 'r1', sessionId: 's-live' }, 200]] as const) {
+      const reply = response(); await routes.notifyReview!({ method: 'POST', headers: mutationHeaders, socket: { remoteAddress: '127.0.0.1' }, body: JSON.stringify(body) }, reply)
+      expect(reply.statusCode).toBe(status)
+    }
+    expect(requestReviewNotification).toHaveBeenCalledExactlyOnceWith('t1', 'r1', 'human:desktop')
+    const reply = response(); await routes.notifyReview!({ method: 'POST', headers: { ...mutationHeaders, origin: 'http://foreign.test', 'sec-fetch-site': 'cross-site' }, socket: { remoteAddress: '127.0.0.1' }, body: JSON.stringify({ taskId: 't1', roundId: 'r1', sessionId: 's-live' }) }, reply)
+    expect(reply.statusCode).toBe(403); expect(requestReviewNotification).toHaveBeenCalledOnce()
+  })
+  it('requests one exact saved submission handoff through the existing human authority fence', async () => {
+    const requestSubmissionNotification = vi.fn(async () => [{ recipient: 'lead', purpose: 'lead-acceptance', state: 'queued', messageId: 'm1', requestId: 'q1' }])
+    const routes = routeOf(async () => baseState, undefined, { taskStore: { requestSubmissionNotification } as unknown as TaskStore })
+    const reply = response()
+    await routes.notifySubmission!({ method: 'POST', headers: mutationHeaders, socket: { remoteAddress: '127.0.0.1' }, body: JSON.stringify({ taskId: 't1', submissionId: 'sub1', sessionId: 's-live' }) }, reply)
+    expect(reply.statusCode).toBe(200)
+    expect(requestSubmissionNotification).toHaveBeenCalledWith('t1', 'sub1', 'human:desktop')
+    expect(JSON.parse(reply.body!)).toMatchObject({ notifications: [{ state: 'queued', requestId: 'q1' }] })
+  })
+  it('rejects repair without an exact submission or from a foreign origin', async () => {
+    const requestSubmissionNotification = vi.fn()
+    const routes = routeOf(async () => baseState, undefined, { taskStore: { requestSubmissionNotification } as unknown as TaskStore })
+    for (const [headers, body, status] of [[mutationHeaders, { taskId: 't1', sessionId: 's-live' }, 400], [{ ...mutationHeaders, origin: 'http://foreign.test', 'sec-fetch-site': 'cross-site' }, { taskId: 't1', submissionId: 'sub1', sessionId: 's-live' }, 403]] as const) {
+      const reply = response(); await routes.notifySubmission!({ method: 'POST', headers, socket: { remoteAddress: '127.0.0.1' }, body: JSON.stringify(body) }, reply)
+      expect(reply.statusCode).toBe(status)
+    }
+    expect(requestSubmissionNotification).not.toHaveBeenCalled()
+  })
   const task: TeamTask = { id: 'task-1', teamId: 'team-1', title: 'Task one', kind: 'implementation', status: 'waiting', assignee: 'z-live', route: { type: 'report', to: 'human' }, acceptance: ['done'], roundLimit: 5, createdBy: 'z-live', createdAt: 1, updatedAt: 2, revision: 1 }
   const detail: ReadTaskResult = { task, document: '# Task one', submissions: [{ id: 'submission-1', taskId: 'task-1', attemptId: 'attempt-1', attemptGeneration: 1, artifact: { type: 'report', bodyRef: 'report.md', bodyDigest: 'digest' }, summary: 'done', checks: [], createdAt: 2, revision: 1 }], rounds: [{ id: 'round-1', taskId: 'task-1', submissionId: 'submission-1', reviewerMemberId: 'm-dead', round: 1, verdict: 'pass', evidence: [{ command: 'test', status: 'passed' }], findings: [], createdAt: 3, revision: 1 }], attempts: [{ id: 'attempt-1', taskId: 'task-1', memberId: 'z-live', sessionId: 's-live', bindingGeneration: 0, generation: 1, status: 'active', startedAt: 1, revision: 1 }] }
   function taskStore(overrides: Partial<TaskStore> = {}): TaskStore {
     return { listTasks: vi.fn(async () => [task]), readTask: vi.fn(async () => detail), acceptTask: vi.fn(async (request) => { expect(request.actor).toBe('human:desktop'); return { task: { ...task, status: 'completed' }, archivedPath: '/archive/task-1.md' } }), reviseTask: vi.fn(async (request) => { expect(request.actor).toBe('human:desktop'); return { task: { ...task, status: 'in_progress' } } }), ...overrides } as unknown as TaskStore
   }
+  it('shows return execution uncertainty separately from confirmed Session input in the journal', async () => {
+    const events = [{ kind: 'review/returned', taskId: 'task-1', actor: 'scheduler', state: 'unconfirmed', reason: 'execution-not-yet-observed', at: 1 }, { kind: 'review/returned', taskId: 'task-1', actor: 'scheduler', state: 'started', requestId: 'req1', turn: 2, inputSeq: 3, at: 2 }]
+    const route = routeOf(async () => baseState, { get: () => undefined }, { readEvents: async () => ({ events, torn: null }) })
+    const result = response(); await route.journal?.({ ...authorized, url: `${LIVE_TEAMS_JOURNAL_ROUTE}?session=s-live` }, result)
+    const body = JSON.parse(result.body ?? '{}')
+    expect(body.entries[0].summary).toContain('Session launch confirmed')
+    expect(body.entries[1].summary).toContain('launch unconfirmed')
+    expect(body.entries[0].fields).toContainEqual({ label: 'Return state', value: 'started' })
+  })
   it('projects a bounded newest-first journal with categories, actor names and torn-tail tolerance', async () => {
     const events = [
       { kind: 'task/created', id: 'task-1', taskId: 'task-1', title: 'Build report', actor: 'z-live', at: 1 },
@@ -108,6 +147,31 @@ describe('B23 task routes', () => {
   })
 
   /**
+   * The panel, the injected context and the mailbox answer one question — who may this member
+   * address — and they had three copies of the answer. The panel's was the narrowest: it showed the
+   * lead "contact with colleagues is not allowed" while the mailbox was delivering the lead's
+   * messages to all of them.
+   */
+  it('shows the lead every member, and a builder the lead, from one rule', () => {
+    const tasks = [{ ...task, id: 'task-1', title: 'Routed', status: 'ready' as const, assignee: 'z-live', route: { type: 'review' as const, reviewer: 'm-dead' } }]
+    const leadState = { ...baseState, leadMemberId: 'z-live' }
+    const lead = projectLiveTeamsSnapshot(leadState, { teamId: 'team-1', workspacePath }, tasks)
+    const leadRow = lead.members.find((member) => member.memberId === 'z-live')
+    // The lead may address every other member: the panel said the opposite while the mailbox was
+    // delivering exactly those messages.
+    expect(leadRow?.permittedContacts).toEqual(expect.arrayContaining(['Ada', 'Mina', 'team', 'human']))
+
+    // A member that is not the lead gets the lead, and whoever a route opens. The reviewer holds the
+    // path to a task it is not the assignee of, so the panel and the mailbox must both see it.
+    const forReviewer = permittedContacts(leadState, 'm-dead', tasks)
+    expect(forReviewer).toContain('z-live')
+    const reviewerRow = lead.members.find((member) => member.memberId === 'm-dead')
+    expect(reviewerRow?.permittedContacts).toContain('Zed')
+    // Same rule, same answer: the panel's list is the mailbox's list, by construction.
+    expect(permittedContacts(leadState, 'z-live', tasks)).toEqual(expect.arrayContaining(['a-unbound', 'm-dead']))
+  })
+
+  /**
    * A `ready` task that is blocked must never look identical to a claimable one:
    * that difference is the whole point of B26, and it must survive projection.
    */
@@ -134,6 +198,19 @@ describe('B23 task routes', () => {
     // A stored reference to a task that is gone can never be satisfied, so it is
     // reported as blocking rather than silently ignored.
     expect(byId.get('task-4')?.blockedBy).toEqual([{ id: 'task-missing', title: 'task-missing', status: 'failed' }])
+  })
+
+  it('does not duplicate the direction already delivered by the task store', async () => {
+    const sendFromScheduler = vi.fn(async () => undefined)
+    const store = taskStore({ reviseTask: async () => {
+      await sendFromScheduler()
+      return { task: { ...task, status: 'in_progress' } }
+    } })
+    const route = routeOf(async () => baseState, { get: () => undefined }, { taskStore: store, mailbox: { sendFromScheduler } as unknown as import('./mailbox.js').MailboxService })
+    const result = response()
+    await route.revise?.({ method: 'POST', headers: mutationHeaders, socket: { remoteAddress: '127.0.0.1' }, body: JSON.stringify({ sessionId: 's-live', taskId: 'task-1', instructions: 'fix it' }) }, result)
+    expect(result.statusCode).toBe(200)
+    expect(sendFromScheduler).toHaveBeenCalledTimes(1)
   })
 
   it('lists, reads, accepts and revises through the existing task store with the human actor', async () => {

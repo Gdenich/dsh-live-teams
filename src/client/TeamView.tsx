@@ -1,26 +1,27 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
-import {
-  Button,
-  MarkdownText,
-  IconEditOutline16,
-  IconPlusOutline16,
-  Modal,
-  IconPauseOutline16,
-  IconPlayOutline16,
-  IconRefreshOutline16,
-  IconChevronDownOutline14,
-  StateDot,
-  Tag,
-  Tooltip,
-} from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, MarkdownText, Modal, StateDot, Tag, Tooltip } from './primitives.js'
+import { IconChevronDown, IconEdit, IconPause, IconPlay, IconPlus, IconRefresh } from './icons.js'
 import type { DispatchTaskVerdict, MessageKind, TaskStatus, TaskSummary, TeamAdoptionCandidate, TeamAttemptStatus, TeamCandidate, TeamDispatch, TeamInboxMessage, TeamMember, TeamSnapshot, TeamRoles, TeamSubmissionScope, TeamTaskDetail } from './api.js'
 import type { LocaleKey } from './locales.js'
 import { memberNameFromTitle } from './member-name.js'
-import { acceptTeamTask, acknowledgeTeamMessage, adoptTeam, addTeamMember, createTeamTask, revokeTeamTask, updateTeamTask, canOpenWorkspaceRoles, changeMemberAvailability, changeMemberDisplayName, changeMemberRole, createTeamSessionMember, disableTeam, enableTeam, fetchTeamAdoptionCandidates, fetchTeamAttention, fetchTeamCandidates, fetchTeamInbox, fetchTeamLead, fetchTeamRoles, fetchTeamSnapshot, fetchTeamState, fetchTeamTask, fetchTeamTasks, grantTeamContact, interruptTeamMember, LiveTeamsApiError, openTeamBriefing, openTeamRoles, overrideTeamRole, removeTeamMember, renameTeam, reviseTeamTask, sendTeamMessage, setTeamLead, fetchTeamDispatch, setTeamDispatch, type TeamStateStatus } from './api.js'
+import { acceptTeamTask, acknowledgeTeamMessage, adoptTeam, addTeamMember, cancelTeamTask, resumeTeamTask, createTeamTask, revokeTeamTask, updateTeamTask, canOpenWorkspaceRoles, changeMemberAvailability, changeMemberDisplayName, changeMemberRole, createTeamSessionMember, disableTeam, enableTeam, fetchTeamAdoptionCandidates, fetchTeamAttention, fetchTeamCandidates, fetchTeamInbox, fetchTeamLead, fetchTeamRoles, fetchTeamSnapshot, fetchTeamState, fetchTeamTask, fetchTeamTasks, grantTeamContact, interruptTeamMember, LiveTeamsApiError, openTeamBriefing, openTeamRoles, overrideTeamRole, removeTeamMember, renameTeam, reviseTeamTask, sendTeamMessage, setTeamLead, fetchTeamDispatch, setTeamDispatch, type TeamStateStatus } from './api.js'
 import './styles.js'
+import { SidePanel } from './SidePanel.js'
+import { TeamGlyph } from './TeamGlyph.js'
+import { RoleAvatar } from './RoleAvatar.js'
+import { reconcileMemberDrafts } from './member-drafts.js'
+import { activityHeading, activityMatchesMode, memberTaskReferences, taskDecisionStage, type ActivityMode } from './team-presentation.js'
+import { reviewReturnNoticeClass } from '../review-return-state.js'
 
 export type TeamViewContext = {
-  readonly sessions: { open(sessionId: string): void }
+  /** Kept for the roster and the attention chip; opening a session no longer goes through it. */
+  readonly sessions?: { open?(sessionId: string): void }
+  /**
+   * Opens a member's session, returning whether this host offers a way to do it at all. The host
+   * changed how sessions are opened between 0.1.5 and 0.1.7, so the panel asks for the behaviour
+   * rather than for a service by name.
+   */
+  readonly openSession?: (sessionId: string) => boolean
   readonly t: (key: LocaleKey) => string
 }
 
@@ -91,6 +92,7 @@ type JournalEntry = {
 }
 type JournalResponse = { readonly teamId: string; readonly entries: JournalEntry[]; readonly nextOffset?: number; readonly truncated?: boolean }
 
+const activityModeKeys: Record<ActivityMode, LocaleKey> = { important: 'journalImportant', all: 'journalAll', technical: 'journalTechnical' }
 const journalCategories: readonly JournalCategory[] = ['message', 'delivery', 'task', 'review', 'contact', 'team', 'member', 'other']
 const journalCategoryKeys: Record<JournalCategory, LocaleKey> = {
   message: 'journalFilterMessage',
@@ -120,7 +122,7 @@ async function fetchJournal(session?: string, after?: number): Promise<JournalRe
   if (session !== undefined && session.length > 0) query.set('session', session)
   const response = await fetch(`/api/live-teams/journal?${query.toString()}`, { method: 'GET', cache: 'no-store', credentials: 'same-origin', headers: { accept: 'application/json' } })
   let body: unknown
-  try { body = await response.json() as unknown } catch { throw new LiveTeamsApiError(response.status, 'invalid team response') }
+  try { body = await response.json() as unknown } catch { throw new LiveTeamsApiError(response.status, `invalid team response (HTTP ${response.status}; non-JSON body)`) }
   if (!response.ok) {
     const error = body !== null && typeof body === 'object' && !Array.isArray(body) && typeof (body as Record<string, unknown>).error === 'string' ? (body as Record<string, unknown>).error as string : 'team request failed'
     throw new LiveTeamsApiError(response.status, error)
@@ -252,6 +254,12 @@ const DISPATCH_CHIP_KEYS: Record<string, LocaleKey> = {
   'human-intervened': 'taskQueuedIntervened',
 }
 
+const reviewReturnKeys: Record<NonNullable<TaskSummary['reviewReturn']>['state'], LocaleKey> = {
+  pending: 'reviewReturnpending', sending: 'reviewReturnsending', delivered: 'reviewReturndelivered',
+  started: 'reviewReturnstarted', completed: 'reviewReturncompleted', blocked: 'reviewReturnblocked',
+  failed: 'reviewReturnfailed', unconfirmed: 'reviewReturnunconfirmed', superseded: 'reviewReturnsuperseded',
+}
+
 function taskStatusLabel(status: TaskSummary['status'], t: (key: LocaleKey) => string): string {
   return t(taskStatusKeys[status])
 }
@@ -323,8 +331,12 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
   const [inboxLoading, setInboxLoading] = useState(true)
   /** Unread count for the folded header, read from the same projection as the header chip. */
   const [attentionWaiting, setAttentionWaiting] = useState(0)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [activityMode, setActivityMode] = useState<ActivityMode>('important')
+  useEffect(() => { setSettingsOpen(false); setExpandedMembers(new Set()) }, [session])
   const [journal, setJournal] = useState<JournalEntry[]>([])
   const [journalLoading, setJournalLoading] = useState(true)
+  const [journalNotice, setJournalNotice] = useState<string | null>(null)
   const [journalFilters, setJournalFilters] = useState<Set<JournalCategory>>(() => new Set(journalCategories))
   const [expandedMembers, setExpandedMembers] = useState<Set<string>>(() => new Set())
   const [briefingExpanded, setBriefingExpanded] = useState(false)
@@ -340,7 +352,7 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
   const [taskNotice, setTaskNotice] = useState<string | null>(null)
   const [taskNote, setTaskNote] = useState('')
   const [taskInstructions, setTaskInstructions] = useState('')
-  const [taskConfirm, setTaskConfirm] = useState<{ kind: 'accept' | 'revise'; task: TaskSummary } | null>(null)
+  const [taskConfirm, setTaskConfirm] = useState<{ kind: 'accept' | 'revise' | 'cancel'; task: TaskSummary } | null>(null)
   // The human's own control over work: a draft for a new task or an edited contract, and a reason
   // for releasing a held attempt.
   /** Where the journal read left off. A ref: changing it must not re-create the poll callback. */
@@ -406,6 +418,7 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
     // tick made the journal blink every four seconds (found by the human on the stand).
     if (!silent) setJournalLoading(true)
     void fetchJournal(session, journalOffset.current).then((next) => {
+      setJournalNotice(null)
       if (next.nextOffset !== undefined) journalOffset.current = next.nextOffset
       setJournal((current) => {
         // The first read is the tail of the file, so it replaces what we have; later reads are deltas.
@@ -417,8 +430,12 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
         // The panel shows recent history; the file keeps all of it.
         return merged.slice(0, 500)
       })
-    }).catch(() => { if (!silent) setJournal([]) }).finally(() => { if (!silent) setJournalLoading(false) })
-  }, [session])
+    }).catch((cause: unknown) => {
+      // A failed read is not an empty history. Keep the last good entries and
+      // expose the failed refresh, including failures from background polling.
+      setJournalNotice(`${t('journalLoadFailed')}${cause instanceof LiveTeamsApiError ? ` — ${cause.error}` : ''}`)
+    }).finally(() => { if (!silent) setJournalLoading(false) })
+  }, [session, t])
 
   const refreshTasks = useCallback((includeArchived = taskFilter === 'archived', options: { silent?: boolean } = {}) => {
     const silent = options.silent === true
@@ -456,10 +473,8 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
     }).finally(() => setDispatchBusy(false))
   }, [dispatch, refreshTasks, session, t])
 
-  /** Member-facing signature: identity, role, name, availability, binding. */
-  const memberSignature = (value: TeamSnapshot | null): string => value === null ? '' : value.members
-    .map((member) => [member.memberId, member.role, member.displayName, member.availability, member.sessionId ?? '', member.live === true ? 'live' : 'idle'].join(':'))
-    .join('|')
+  /** Include all projected facts, especially observed status, contact grants and revisions. */
+  const memberSignature = (value: TeamSnapshot | null): string => JSON.stringify(value)
 
   const refresh = useCallback((options: { silent?: boolean } = {}) => {
     const silent = options.silent === true
@@ -474,8 +489,9 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
         // A background poll that changes nothing must not replace the snapshot: rebuilding
         // the drafts from it would wipe whatever the human is typing into a name or role.
         if (memberSignature(current) === memberSignature(next)) return current
-        setRoleDrafts(Object.fromEntries(next.members.map((member) => [member.memberId, member.role])))
-        setNameDrafts(Object.fromEntries(next.members.map((member) => [member.memberId, member.displayName])))
+        const previous = current?.teamId === next.teamId ? current.members : []
+        setRoleDrafts(drafts => reconcileMemberDrafts(previous, next.members, drafts, 'role'))
+        setNameDrafts(drafts => reconcileMemberDrafts(previous, next.members, drafts, 'displayName'))
         return next
       })
     }).catch((cause: unknown) => {
@@ -574,6 +590,13 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
     if (teamState?.enabled === true) refreshTasks(taskFilter === 'archived')
   }, [taskFilter, teamState?.enabled, refreshTasks])
 
+  const invalidateTaskDetail = (taskId: string): void => {
+    setTaskDetails((current) => { const next = { ...current }; delete next[taskId]; return next })
+    // The next explicit expansion fetches current evidence, rather than showing a stale
+    // attempt or a permanent loading placeholder after a mutation removed the cache entry.
+    setTaskExpanded((current) => current === taskId ? null : current)
+  }
+
   const loadTaskDetail = (summary: TaskSummary): void => {
     setTaskExpanded(summary.id)
     if (taskDetails[summary.id] !== undefined) return
@@ -622,9 +645,10 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
           ...(lines(draftChecks).length === 0 ? {} : { checks: lines(draftChecks) }),
           ...(draftBody.trim().length === 0 ? {} : { body: draftBody }),
         }, session)
-    void request.then(() => {
+    void request.then((result) => {
+      invalidateTaskDetail(result.task.id)
       setTaskDraft(null)
-      setTaskNotice(t('taskSaved'))
+      setTaskNotice([t('taskSaved'), ...result.warnings.map((warning) => `${t(warning.code === 'path-no-match' ? 'taskPathNoMatch' : 'taskPathScanIncomplete')}: ${warning.pattern}`)].join('\n'))
       refreshTasks(taskFilter === 'archived')
     }).catch((cause: unknown) => setTaskNotice(cause instanceof LiveTeamsApiError ? cause.error : t('taskActionFailed'))).finally(() => setDraftBusy(false))
   }
@@ -633,24 +657,42 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
     if (releaseTarget === null || draftBusy || releaseReason.trim().length === 0) return
     setDraftBusy(true)
     setTaskNotice(null)
-    void revokeTeamTask({ taskId: releaseTarget.id, reason: releaseReason.trim() }, session).then(() => {
+    void revokeTeamTask({ taskId: releaseTarget.id, reason: releaseReason.trim() }, session).then((result) => {
+      invalidateTaskDetail(releaseTarget.id)
       setReleaseTarget(null)
       setReleaseReason('')
-      setTaskNotice(t('taskReleased'))
+      setTaskNotice(t(result.quiesced ? 'taskReleased' : 'taskStopUnconfirmed'))
       refreshTasks(taskFilter === 'archived')
     }).catch((cause: unknown) => setTaskNotice(cause instanceof LiveTeamsApiError ? cause.error : t('taskActionFailed'))).finally(() => setDraftBusy(false))
   }
 
-  const runTaskAction = (kind: 'accept' | 'revise', summary: TaskSummary): void => {
+  const resumeTask = (summary: TaskSummary): void => {
+    if (taskBusy !== null || draftBusy) return
+    setTaskBusy(summary.id)
+    setTaskNotice(null)
+    void resumeTeamTask(summary.id, session).then(() => {
+      setTaskNotice(t('taskResumed'))
+      invalidateTaskDetail(summary.id)
+      refreshTasks(taskFilter === 'archived')
+    }).catch((cause: unknown) => setTaskNotice(cause instanceof LiveTeamsApiError ? cause.error : t('taskActionFailed'))).finally(() => setTaskBusy(null))
+  }
+
+  const runTaskAction = (kind: 'accept' | 'revise' | 'cancel', summary: TaskSummary): void => {
     if (taskBusy !== null) return
     setTaskBusy(summary.id)
     setTaskNotice(null)
-    const request = kind === 'accept' ? acceptTeamTask(summary.id, taskNote.trim().length === 0 ? undefined : taskNote.trim(), session) : reviseTeamTask(summary.id, taskInstructions.trim(), session)
-    void request.then(() => {
+    const request = kind === 'cancel'
+      // Closing by hand is for work that will never be submitted: the reason goes into the journal.
+      ? cancelTeamTask(summary.id, taskInstructions.trim(), session)
+      : kind === 'accept'
+        ? acceptTeamTask(summary.id, taskNote.trim().length === 0 ? undefined : taskNote.trim(), session)
+        : reviseTeamTask(summary.id, taskInstructions.trim(), session)
+    void request.then((result) => {
+      if ('quiesced' in result && !result.quiesced) setTaskNotice(t('taskStopUnconfirmed'))
       setTaskConfirm(null)
       setTaskNote('')
       setTaskInstructions('')
-      setTaskDetails((current) => { const next = { ...current }; delete next[summary.id]; return next })
+      invalidateTaskDetail(summary.id)
       refreshTasks(taskFilter === 'archived')
     }).catch((cause: unknown) => setTaskNotice(cause instanceof LiveTeamsApiError ? cause.error : t('taskActionFailed'))).finally(() => setTaskBusy(null))
   }
@@ -761,16 +803,37 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
   }
   const roleOptions = roleData?.roles ?? []
   const roleById = new Map<string, TeamRoles['roles'][number]>(roleOptions.map((role) => [role.id, role]))
-  const canSaveMember = addName.trim().length > 0 && addRole.trim().length > 0 && roleById.has(addRole) && !addBusy && !candidateLoading
+  // A new Session needs a name and a role, nothing else. The candidate list is for the *other*
+  // path — binding a Session that already exists — so waiting for it must not disable this button:
+  // a list that never arrives left the human with a dead button and no message (found on the stand).
+  // The candidate list is optional: with nothing selected the button creates a new Session, which
+  // needs a name and a role and nothing else. Requiring the list to finish — in any form — is what
+  // left the human with a dead button on the stand.
+  const canSaveMember = addName.trim().length > 0 && addRole.trim().length > 0 && roleById.has(addRole) && !addBusy
 
   const createMember = (): void => {
-    if (snapshot === null || !canSaveMember) return
+    if (!canSaveMember) return
     setAddBusy(true)
     setNotice(null)
-    const request = selectedCandidate === undefined
-      ? createTeamSessionMember({ displayName: addName, role: addRole, expectedRevision: snapshot.revision }, session)
-      : addTeamMember({ sessionId: selectedCandidate.sessionId, displayName: addName, role: addRole, expectedRevision: snapshot.revision }, session)
-    void request.then(() => {
+    // The snapshot carries the revision the write is fenced against. Returning silently when it is
+    // missing made the button look dead — the third form of the same defect on this stand. Fetch it
+    // here, and if that fails, say so.
+    const withRevision = async (): Promise<TeamSnapshot | null> => {
+      if (snapshot !== null) return snapshot
+      try {
+        const fetched = await fetchTeamSnapshot(session)
+        setSnapshot(fetched)
+        return fetched
+      } catch { setNotice(t('memberNeedsState')); setAddBusy(false); return null }
+    }
+    const request = withRevision().then((current) => {
+      if (current === null) return undefined
+      return selectedCandidate === undefined
+        ? createTeamSessionMember({ displayName: addName, role: addRole, expectedRevision: current.revision }, session)
+        : addTeamMember({ sessionId: selectedCandidate.sessionId, displayName: addName, role: addRole, expectedRevision: current.revision }, session)
+    })
+    void request.then((result) => {
+      if (result === undefined) return
       setAddOpen(false)
       setNotice(t('memberCreated'))
       refresh()
@@ -795,7 +858,11 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
   }, [busy, editingName])
 
   const openMember = (member: TeamMember): void => {
-    if (member.sessionId !== null) props.ctx?.sessions.open(member.sessionId)
+    if (member.sessionId === null) return
+    const opened = props.ctx?.openSession?.(member.sessionId)
+    // Never fail silently: a click that does nothing is what made this look like a broken button
+    // rather than a host that moved the API.
+    if (opened !== true) setNotice(t('openSessionUnavailable'))
   }
 
   /**
@@ -804,6 +871,7 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
    * again closes it.
    */
   const toggleMemberPanel = (memberId: string): void => {
+    setSettingsOpen(false)
     setExpandedMembers((current) => current.has(memberId) ? new Set() : new Set([memberId]))
   }
 
@@ -993,11 +1061,13 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
   const liveCount = members.filter((member) => member.live).length
   const pausedCount = members.filter((member) => member.availability === 'paused').length
   const unboundCount = members.filter((member) => member.sessionId === null).length
+   const visibleTasks = taskSummaries.filter(task => taskMatchesFilter(task, taskFilter))
    const activeTaskCount = taskSummaries.filter(isActiveTask).length
    const awaitingLeadCount = taskSummaries.filter(awaitsLead).length
   const sectionTitleId = 'dsh-live-teams-members-title'
-   const visibleJournal = journalFilters.size === 0 || journalFilters.size === journalCategories.length ? journal : journal.filter((entry) => journalFilters.has(entry.category))
+   const visibleJournal = journal.filter(entry => activityMatchesMode(entry, activityMode) && (journalFilters.size === 0 || journalFilters.has(entry.category)))
    const toggleJournalFilter = (category: JournalCategory): void => {
+      if (activityMode === 'important' && ['delivery', 'contact', 'other'].includes(category)) setActivityMode('all')
      setJournalFilters((current) => {
        if (current.size === journalCategories.length) return new Set([category])
        const next = new Set(current)
@@ -1011,25 +1081,8 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
      try { return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(at)) } catch { return '—' }
    }
 
-  return (
-    <section className="dshLiveTeamsRoot" aria-label={t('title')}>
-     <div className="dshLiveTeamsShell">
-       <div className="dshLiveTeamsCols dshLiveTeamsHead">
-      <section className="dshLiveTeamsCard dshLiveTeamsSummary" aria-labelledby="dsh-live-teams-summary-title">
-        <div className="dshLiveTeamsSectionHeader">
-          <h3 id="dsh-live-teams-summary-title">{t('summaryTitle')}</h3>
-          
-        </div>
-        <dl className="dshLiveTeamsSummaryGrid">
-          <Stat label={t('totalMembers')} value={members.length} />
-          <Stat label={t('liveMembers')} value={liveCount} />
-          <Stat label={t('pausedMembers')} value={pausedCount} />
-          <Stat label={t('unboundMembers')} value={unboundCount} />
-           <Stat label={t('activeTasks')} value={activeTaskCount} />
-           <Stat label={t('awaitingLead')} value={awaitingLeadCount} />
-        </dl>
-      </section>
-       <section className="dshLiveTeamsCard dshLiveTeamsTeamControls" aria-label={t('title')}>
+  const selectedMember = members.find(member => expandedMembers.has(member.memberId))
+  const settingsPanel = (<section className="dshLiveTeamsCard dshLiveTeamsTeamControls" aria-label={t('title')}>
       <div className="dshLiveTeamsHeader">
         <div className="dshLiveTeamsHeaderCopy">
           {editingTeamName ? (
@@ -1045,7 +1098,7 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
               <span className="dshLiveTeamsNameLine">
                 {teamState?.teamName ?? t('title')}
                 <button className="dshLiveTeamsEditNameButton" type="button" onClick={() => setEditingTeamName(true)} aria-label={`${t('renameTeam')}: ${teamState?.teamName ?? ''}`} title={t('renameTeam')}>
-                  <IconEditOutline16 size={14} />
+                  <IconEdit size={14} />
                 </button>
               </span>
             </h2>
@@ -1053,14 +1106,14 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
 
         </div>
         <button className="dshLiveTeamsIconButton" type="button" onClick={() => refresh()} disabled={loading} aria-label={t('refresh')} title={t('refresh')}>
-          <IconRefreshOutline16 />
+          <IconRefresh />
         </button>
         <label className="dshLiveTeamsLeadControl"><span>{t('lead')}</span><select value={leadMemberId ?? ''} disabled={teamBusy} onChange={(event) => { setTeamBusy(true); void setTeamLead(event.target.value, session).then(() => { setLeadMemberId(event.target.value); setNotice(t('leadUpdated')) }).catch(() => setNotice(t('teamActionFailed'))).finally(() => setTeamBusy(false)) }}><option value="">{t('leadUnset')}</option>{members.map((member) => <option key={member.memberId} value={member.memberId}>{member.displayName}</option>)}</select></label>
         <button className="dshLiveTeamsTeamToggle" type="button" disabled={teamBusy} onClick={() => setDisableConfirm(true)}>{t('disableTeam')}</button>
       </div>
-      <section className={`dshLiveTeamsBriefing${briefingExpanded ? ' dshLiveTeamsPanelExpanded' : ''}`} aria-labelledby="dsh-live-teams-briefing-title"><button className="dshLiveTeamsCollapseHeader" type="button" aria-expanded={briefingExpanded} onClick={() => setBriefingExpanded((current) => !current)}><span className="dshLiveTeamsDisclosure" aria-hidden="true"><IconChevronDownOutline14 size={14} /></span><span className="dshLiveTeamsCollapseHeaderCopy"><strong id="dsh-live-teams-briefing-title">{t('briefing')}</strong><span>{briefingExpanded ? t('briefingHint') : briefingSummary}</span></span></button><button className="dshLiveTeamsAddButton" type="button" onClick={() => { void openTeamBriefing(session).then(() => setNotice(t('briefingOpened'))).catch(() => setNotice(t('openBriefingFailed'))) }} disabled={teamState?.openAvailable !== true}>{t('openBriefing')}</button>{briefingExpanded && <pre>{briefingText || t('briefingEmpty')}</pre>}</section>
+      <section className={`dshLiveTeamsBriefing${briefingExpanded ? ' dshLiveTeamsPanelExpanded' : ''}`} aria-labelledby="dsh-live-teams-briefing-title"><button className="dshLiveTeamsCollapseHeader" type="button" aria-expanded={briefingExpanded} onClick={() => setBriefingExpanded((current) => !current)}><span className="dshLiveTeamsDisclosure" aria-hidden="true"><IconChevronDown size={14} /></span><span className="dshLiveTeamsCollapseHeaderCopy"><strong id="dsh-live-teams-briefing-title">{t('briefing')}</strong><span>{briefingExpanded ? t('briefingHint') : briefingSummary}</span></span></button><button className="dshLiveTeamsAddButton" type="button" onClick={() => { void openTeamBriefing(session).then(() => setNotice(t('briefingOpened'))).catch(() => setNotice(t('openBriefingFailed'))) }} disabled={teamState?.openAvailable !== true}>{t('openBriefing')}</button>{briefingExpanded && <pre>{briefingText || t('briefingEmpty')}</pre>}</section>
         <section className={`dshLiveTeamsRoles dshLiveTeamsControlDisclosure${rolesExpanded ? ' dshLiveTeamsPanelExpanded' : ''}`} aria-labelledby="dsh-live-teams-roles-title">
-          <button className="dshLiveTeamsCollapseHeader" type="button" aria-expanded={rolesExpanded} onClick={() => setRolesExpanded((current) => !current)}><span className="dshLiveTeamsDisclosure" aria-hidden="true"><IconChevronDownOutline14 size={14} /></span><span className="dshLiveTeamsCollapseHeaderCopy"><strong id="dsh-live-teams-roles-title">{t('roles')}</strong><span>{rolesExpanded ? t('rolesCaption') : `${roleOptions.length} ${t('rolesCount')}`}</span></span></button>
+          <button className="dshLiveTeamsCollapseHeader" type="button" aria-expanded={rolesExpanded} onClick={() => setRolesExpanded((current) => !current)}><span className="dshLiveTeamsDisclosure" aria-hidden="true"><IconChevronDown size={14} /></span><span className="dshLiveTeamsCollapseHeaderCopy"><strong id="dsh-live-teams-roles-title">{t('roles')}</strong><span>{rolesExpanded ? t('rolesCaption') : `${roleOptions.length} ${t('rolesCount')}`}</span></span></button>
           {rolesExpanded && <>
           <div className="dshLiveTeamsRoleActions">
             {roleData !== null && roleData.globalOpenAvailable && <button className="dshLiveTeamsAddButton" type="button" onClick={() => openRolesPath('global')} aria-label={t('openGlobalRoles')}>{t('openGlobalRoles')}</button>}
@@ -1087,15 +1140,14 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
         {<p className="dshLiveTeamsMessage">{t('disableTeamKeeps')}</p>}
       </Modal>
       {notice !== null && <p className="dshLiveTeamsNotice" role="status">{notice}</p>}
-       </section>
-       </div>
-      <section className="dshLiveTeamsCard dshLiveTeamsMembers" aria-labelledby={sectionTitleId}>
+       </section>)
+  const membersPanel = (<section className="dshLiveTeamsCard dshLiveTeamsMembers" aria-labelledby={sectionTitleId}>
         <div className="dshLiveTeamsSectionHeader">
-          <h3 id={sectionTitleId}>{t('membersTitle')}</h3>
+          <h3 id={sectionTitleId}>{t('membersTitle')} <span className="dshLiveTeamsMemberCount">({members.length})</span></h3>
           <p className="dshLiveTeamsSectionCaption">{t('membersCaption')}</p>
         </div>
         <button className="dshLiveTeamsAddButton" type="button" onClick={openAddMember} aria-label={t('addMember')}>
-          <IconPlusOutline16 size={14} />
+          <IconPlus size={14} />
           <span>{t('addMember')}</span>
         </button>
         <Modal open={addOpen} onClose={() => { if (!addBusy) setAddOpen(false) }} title={t('addMemberTitle')} closeLabel={t('cancel')} description={t('addMemberDescription')} footer={<><Button variant="outline" size="sm" type="button" disabled={addBusy} onClick={() => setAddOpen(false)}>{t('cancel')}</Button><Button variant="primary" size="sm" type="button" disabled={!canSaveMember} onClick={createMember}>{t('createMember')}</Button></>}>
@@ -1127,72 +1179,44 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
             {members.map((member) => {
               const expanded = expandedMembers.has(member.memberId)
               const paused = member.availability === 'paused'
+              const assignments = memberTaskReferences(taskSummaries, member.memberId)
               return <li className={`dshLiveTeamsRow${expanded ? ' dshLiveTeamsRowSelected' : ''}`} data-role={member.role} key={member.memberId}>
-                <details open={expanded}><summary className="dshLiveTeamsMemberCollapsed" aria-expanded={expanded} onClick={() => toggleMemberPanel(member.memberId)}><span className="dshLiveTeamsDisclosure" aria-hidden="true"><IconChevronDownOutline14 size={14} /></span><strong className="dshLiveTeamsMemberName">{member.displayName}</strong><span className="dshLiveTeamsMemberChip">{member.role}</span><span className="dshLiveTeamsMemberChip">{paused ? t('pausedState') : member.availability === 'available' ? t('available') : member.availability}</span><span className={`dshLiveTeamsMemberLive${member.live ? ' dshLiveTeamsMemberLiveOn' : ''}`}>● {member.live ? t('live') : t('notLive')}</span><span className="dshLiveTeamsMemberNote">{member.note ?? t('noNote')}</span></summary></details>
+                <button type="button" aria-haspopup="dialog" title={member.availability === 'available' ? t('available') : member.availability === 'paused' ? t('pausedState') : member.availability} className="dshLiveTeamsMemberCollapsed" aria-expanded={expanded} onClick={() => toggleMemberPanel(member.memberId)}><RoleAvatar role={member.role} label={roleOptions.find(role => role.id === member.role)?.name ?? member.role} roles={roleData?.roles ?? []} /><span className="dshLiveTeamsMemberCopy"><strong className="dshLiveTeamsMemberName">{member.displayName}</strong><span className={`dshLiveTeamsMemberLive${member.live ? ' dshLiveTeamsMemberLiveOn' : ''}`}>● {member.live ? t('live') : t('notLive')} · {statusLabel(member, t)}</span><span className="dshLiveTeamsMemberChip">{roleOptions.find(role => role.id === member.role)?.name ?? member.role}</span></span><span className="dshLiveTeamsMemberMenu" aria-hidden="true">⋮</span>{paused ? <span className="dshLiveTeamsMemberPaused">{t('pausedState')}</span> : null}<span className="dshLiveTeamsMemberTask" title={assignments.map(task => task.title).join('; ')}>{assignments.length === 0 ? t('noAssignedTask') : `${t('assignedTasks')}: ${assignments[0]?.title}${assignments.length > 1 ? ` +${assignments.length - 1}` : ''}`}</span>{member.note?.trim() ? <span className="dshLiveTeamsMemberNote">{member.note}</span> : null}</button>
               </li>
             })}
           </ul>
         )}
-        {members.filter((member) => expandedMembers.has(member.memberId)).map((member) => {
-          const rowBusy = busy.has(member.memberId)
-          const editing = editingName === member.memberId
-          const roleInputId = `dsh-live-teams-role-${member.memberId}`
-          const nameInputId = `dsh-live-teams-name-${member.memberId}`
-          const nameErrorId = `${nameInputId}-error`
-          const paused = member.availability === 'paused'
-          return <section className="dshLiveTeamsMemberPanel" data-role={member.role} data-member={member.memberId} aria-label={member.displayName} key={`panel-${member.memberId}`}>
-            <div className="dshLiveTeamsMemberHeading">
-              <div className="dshLiveTeamsMemberIdentity">
-                {editing ? <><label className="dshLiveTeamsVisuallyHidden" htmlFor={nameInputId}>{t('name')}</label><input ref={nameInputRef} className="dshLiveTeamsNameInput" id={nameInputId} type="text" value={nameDrafts[member.memberId] ?? member.displayName} disabled={rowBusy || removeBusy} aria-invalid={(nameDrafts[member.memberId] ?? '').trim().length === 0} aria-describedby={nameErrorId} onChange={(event) => setNameDrafts((current) => ({ ...current, [member.memberId]: event.target.value }))} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); applyName(member) } else if (event.key === 'Escape') { event.preventDefault(); cancelNameEdit(member) } }} /></> : null}
-                {!editing && <Tooltip label={t('openSession')} disabled={member.sessionId === null}><button className="dshLiveTeamsMemberAction" type="button" disabled={member.sessionId === null} onClick={() => openMember(member)}><strong className="dshLiveTeamsMemberName">{member.displayName}</strong></button></Tooltip>}
-                {!editing && <button className="dshLiveTeamsMemberOpen" type="button" disabled={member.sessionId === null} title={t('openSession')} onClick={() => openMember(member)}>{t('openSessionAction')}</button>}
-                {!editing && <button ref={(element) => { nameEditButtons.current[member.memberId] = element }} className="dshLiveTeamsEditNameButton" type="button" disabled={rowBusy || removeBusy} onClick={() => beginNameEdit(member)} aria-label={t('editName')} title={t('editName')}><IconEditOutline16 size={14} /></button>}
-                {editing && <div className="dshLiveTeamsNameActions"><Button variant="outline" size="sm" type="button" disabled={rowBusy || removeBusy || (nameDrafts[member.memberId] ?? '').trim().length === 0} onClick={() => applyName(member)}>{t('save')}</Button><Button variant="outline" size="sm" type="button" disabled={rowBusy || removeBusy} onClick={() => cancelNameEdit(member)}>{t('cancel')}</Button></div>}
-                <span className="dshLiveTeamsState">
-                  <span className="dshLiveTeamsStateDot"><StateDot state={stateDot(member)} /></span>
-                  <span className="dshLiveTeamsStateLabel">{stateText(member, t)}</span>
-                </span>
-              </div>
-              <div className="dshLiveTeamsMemberActions">
-                <Tag className="dshLiveTeamsAvailabilityTag" tone="neutral">{paused ? t('pausedState') : member.availability === 'available' ? t('available') : member.availability}</Tag>
-                <button className="dshLiveTeamsIconButton" type="button" disabled={rowBusy || removeBusy} onClick={() => toggleAvailability(member)} aria-label={paused ? t('resume') : t('pause')} title={paused ? t('resume') : t('pause')}>
-                  {paused ? <IconPlayOutline16 size={14} /> : <IconPauseOutline16 size={14} />}
-                </button>
-                {!editing && member.status === 'running' && <button className="dshLiveTeamsInterruptButton" type="button" disabled={rowBusy || removeBusy || interruptBusy} onClick={() => setInterruptTarget(member)} aria-label={`${t('interruptTurn')}: ${member.displayName}`} title={t('interruptTurn')}>{t('interruptTurn')}</button>}
-              </div>
-            </div>
-            {editing && (nameDrafts[member.memberId] ?? '').trim().length === 0 && <p className="dshLiveTeamsFieldError" id={nameErrorId}>{t('nameRequired')}</p>}
-            <div className="dshLiveTeamsControls">
-              <div className="dshLiveTeamsRoleField">
-                <label className="dshLiveTeamsFieldLabel" htmlFor={roleInputId}>{t('role')}</label>
-                <select className="dshLiveTeamsRoleInput" id={roleInputId} value={roleDrafts[member.memberId] ?? member.role} disabled={rowBusy || removeBusy || roleLoading} onChange={(event) => setRoleDrafts((current) => ({ ...current, [member.memberId]: event.target.value }))}><option value={member.role}>{roleById.has(member.role) ? roleById.get(member.role)?.name : `${member.role} (${t('unknownRole')})`}</option>{roleOptions.filter((role) => role.id !== member.role).map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}</select>
-              </div>
-              <Button variant="outline" size="sm" className="dshLiveTeamsApply" type="button" disabled={rowBusy || removeBusy} onClick={() => applyRole(member)}>{t('apply')}</Button>
-            </div>
-            <div className="dshLiveTeamsContactGrant">
-              <span className="dshLiveTeamsFieldLabel">{t('permittedContacts')}</span>
-              <span className="dshLiveTeamsMetaValue">{(member.permittedContacts ?? []).join(', ') || t('noPeerContact')}</span>
-              {member.memberId === leadMemberId && <div className="dshLiveTeamsGrantControls">
-                <select className="dshLiveTeamsRoleInput dshLiveTeamsContactSelect" value={grantTarget} disabled={grantBusy !== null} onChange={(event) => setGrantTarget(event.target.value)}><option value="">{t('chooseContact')}</option>{members.filter((candidate) => candidate.memberId !== member.memberId).map((candidate) => <option key={candidate.memberId} value={candidate.memberId}>{candidate.displayName}</option>)}<option value="team">team</option><option value="human">human</option></select>
-                <Button variant="outline" size="sm" type="button" disabled={grantBusy !== null || (grantTarget).length === 0} onClick={() => { const allow = grantTarget; setGrantBusy(member.memberId); void grantTeamContact({ memberId: member.memberId, allow, action: 'add' }, session).then(() => refresh()).catch((cause: unknown) => setNotice(cause instanceof LiveTeamsApiError ? cause.error : t('grantFailed'))).finally(() => setGrantBusy(null)) }}>{t('grant')}</Button>
-                <Button variant="outline" size="sm" type="button" disabled={grantBusy !== null || (grantTarget).length === 0} onClick={() => { const allow = grantTarget; setGrantBusy(member.memberId); void grantTeamContact({ memberId: member.memberId, allow, action: 'remove' }, session).then(() => refresh()).catch((cause: unknown) => setNotice(cause instanceof LiveTeamsApiError ? cause.error : t('grantFailed'))).finally(() => setGrantBusy(null)) }}>{t('revoke')}</Button>
-              </div>}
-              {/* An absent control reads as a missing feature; say who owns it instead. */}
-              {member.memberId !== leadMemberId && <span className="dshLiveTeamsFieldLabel">{t('contactGrantLeadOnly')}</span>}
-            </div>
-            <div className="dshLiveTeamsMemberMeta">
-              <span className="dshLiveTeamsFieldLabel">{t('note')}</span><span className="dshLiveTeamsMetaValue">{member.note ?? t('noNote')}</span><span className="dshLiveTeamsFieldLabel">{t('binding')}</span>
-              <span className="dshLiveTeamsMetaValue">{bindingLabel(member, t)}{member.sessionId === null ? '' : ` · ${member.sessionId}`}</span>
-              <button className="dshLiveTeamsMemberRemove" type="button" disabled={rowBusy || removeBusy || interruptBusy} onClick={() => setRemoveTarget(member)} aria-label={`${t('removeMember')}: ${member.displayName}`} title={t('removeMember')}>{t('removeMember')}</button>
-            </div>
-          </section>
-        })}
-      </section>
-       {notice !== null && <p className="dshLiveTeamsNotice" role="status">{notice}</p>}
-       <div className="dshLiveTeamsCols dshLiveTeamsMain">
-         <div className="dshLiveTeamsCol dshLiveTeamsMainLeft">
-      <section className="dshLiveTeamsCard dshLiveTeamsJournal" aria-labelledby="dsh-live-teams-journal-title"><div className="dshLiveTeamsCardTitle"><h3 className="dshLiveTeamsCardTitleText" id="dsh-live-teams-journal-title">{t('journalTitle')}</h3><div className="dshLiveTeamsJournalControls"><button className={`dshLiveTeamsInboxButton${attentionWaiting > 0 ? ' dshLiveTeamsInboxButtonUnread' : ''}`} type="button" onClick={() => setInboxExpanded(true)}>{t('messagesTitle')}{attentionWaiting > 0 ? <span className="dshLiveTeamsInboxCount">{attentionWaiting}</span> : null}</button></div><div className="dshLiveTeamsSegmented dshLiveTeamsJournalFilters" role="group" aria-label={t('journalFilters')}>{journalCategories.map((category) => <button key={category} className={`dshLiveTeamsSegmentedButton dshLiveTeamsJournalFilter dshLiveTeamsJournalFilter-${category}${journalFilters.has(category) ? ' dshLiveTeamsSegmentedButtonActive dshLiveTeamsJournalFilterActive' : ''}`} type="button" aria-pressed={journalFilters.has(category)} onClick={() => toggleJournalFilter(category)}>{t(journalCategoryKeys[category])}<span className="dshLiveTeamsKindCount">{journal.filter((entry) => entry.category === category).length}</span></button>)}</div></div>{journalLoading ? <p className="dshLiveTeamsMessage">{t('loading')}</p> : visibleJournal.length === 0 ? <p className="dshLiveTeamsMessage">{t('journalEmpty')}</p> : <ul className="dshLiveTeamsJournalList">{visibleJournal.map((entry) => {
+
+      </section>)
+  const tasksPanel = (<section className="dshLiveTeamsCard dshLiveTeamsTasks dshLiveTeamsListPanel" aria-labelledby="dsh-live-teams-tasks-title"><div className="dshLiveTeamsCardTitle"><h3 className="dshLiveTeamsCardTitleText" id="dsh-live-teams-tasks-title">{t('tasksTitle')}</h3><div className="dshLiveTeamsTaskControls"><button className="dshLiveTeamsTaskNew" type="button" disabled={draftBusy} onClick={openNewTask}><IconPlus size={14} />{t('taskNew')}</button><div className="dshLiveTeamsSegmented dshLiveTeamsTaskFilter" role="group" aria-label={t('taskFilters')}>{(['active', 'waiting', 'archived'] as const).map((filter) => <button className={`dshLiveTeamsSegmentedButton dshLiveTeamsTaskFilterButton${taskFilter === filter ? ' dshLiveTeamsSegmentedButtonActive dshLiveTeamsTaskFilterButtonActive' : ''}`} type="button" key={filter} aria-pressed={taskFilter === filter} onClick={() => setTaskFilter(filter)}>{t(taskFilterKeys[filter])}<span className="dshLiveTeamsKindCount">{taskSummaries.filter(task => taskMatchesFilter(task, filter)).length}</span></button>)}</div>{dispatch === null ? null : <button className={`dshLiveTeamsSegmentedButton dshLiveTeamsDispatchToggle${dispatch.paused ? ' dshLiveTeamsDispatchTogglePaused' : ''}`} type="button" disabled={dispatchBusy} aria-pressed={dispatch.paused} title={dispatch.pausedBy === undefined ? t('dispatchPaused') : `${t('dispatchPaused')} · ${t('dispatchPausedBy')}: ${dispatch.pausedBy}`} onClick={toggleDispatch}>{dispatch.paused ? t('dispatchResume') : t('dispatchPause')}</button>}</div></div>{dispatch?.paused === true && <p className="dshLiveTeamsNotice" role="status">{t('dispatchPaused')}{dispatch.pausedReason === undefined ? '' : ` — ${dispatch.pausedReason}`}</p>}{taskNotice !== null && <p className="dshLiveTeamsNotice" role="status">{taskNotice}</p>}{taskLoading && taskSummaries.length === 0 ? <p className="dshLiveTeamsMessage">{t('loading')}</p> : visibleTasks.length === 0 ? (taskNotice === null ? <div className="dshLiveTeamsTaskEmpty"><TeamGlyph kind="task" /><p>{t('tasksEmpty')}</p></div> : null) : <ul className="dshLiveTeamsTaskList">{visibleTasks.map((summary) => { const expanded = taskExpanded === summary.id; const detail = taskDetails[summary.id]; // The same fact the store checks before it accepts: a submission is in and undecided. Reading the
+// status here as well meant a returned task showed the human nothing but "Release attempt" while a
+// submission sat on the table and the lead's accept was refused.
+      const canDecide = summary.awaitsDecision === true; const canReturn = canDecide || (awaitsLead(summary) && summary.reviewReturn !== undefined && ['failed', 'blocked'].includes(summary.reviewReturn.state)); return <li className="dshLiveTeamsTaskRow" key={summary.id}><button className="dshLiveTeamsTaskSummary" type="button" aria-expanded={expanded} onClick={() => expanded ? setTaskExpanded(null) : loadTaskDetail(summary)}><span className={`dshLiveTeamsTaskDisclosure${expanded ? ' dshLiveTeamsTaskDisclosureOpen' : ''}`} aria-hidden="true"><TeamGlyph kind="task" /><span className="dshLiveTeamsTaskChevron"><IconChevronDown size={10} /></span></span><span className="dshLiveTeamsTaskIdentity"><strong className="dshLiveTeamsTaskTitle">{summary.title}</strong><span className="dshLiveTeamsTaskMetadata">{summary.reviewReturn === undefined ? null : <span className="dshLiveTeamsTaskQueued" data-review-return-state={summary.reviewReturn.state} title={summary.reviewReturn.reason}>{t(reviewReturnKeys[summary.reviewReturn.state])}</span>}<span className="dshLiveTeamsTaskRoute">{routeWords(summary.route)}</span>{summary.blockedBy === undefined || summary.blockedBy.length === 0 ? null : <span className="dshLiveTeamsTaskBlocked" title={blockerWords(summary.blockedBy, t)}>{t('taskBlocked')}</span>}{(() => { const verdict: DispatchTaskVerdict | undefined = dispatch?.tasks.find((entry) => entry.taskId === summary.id); const key = verdict === undefined ? undefined : DISPATCH_CHIP_KEYS[verdict.reason]; return key === undefined ? null : <span className="dshLiveTeamsTaskQueued" title={verdict?.detail}>{t(key)}</span> })()}{(() => { const verdict: DispatchTaskVerdict | undefined = dispatch?.tasks.find((entry) => entry.taskId === summary.id); return verdict?.stalled === undefined ? null : <span className="dshLiveTeamsTaskIntervened" title={verdict.stalled.detail}>{t('taskStalled')}{t(verdict.stalled.reason === 'unacknowledged' ? 'taskStalledUnacknowledged' : 'taskStalledIdle')}</span> })()}</span></span><span className="dshLiveTeamsTaskOwner" title={t('taskAssignee')}><small>{t('taskAssignee')}</small><span>{summary.assigneeName ?? members.find(member => member.memberId === summary.assignee)?.displayName ?? summary.assignee ?? '—'}</span></span><span className="dshLiveTeamsTaskStage" data-status={summary.status} data-route={summary.route?.type}><small>{t('taskStage')}</small><span className="dshLiveTeamsTaskStatus" title={taskStatusLabel(summary.status, t)}>{t(taskDecisionStage(summary) ?? taskStatusKeys[summary.status])}</span></span><span className="dshLiveTeamsTaskRound">{summary.round === undefined || summary.roundLimit === undefined ? '—' : `${summary.round}/${summary.roundLimit}`}</span><span className="dshLiveTeamsTaskAge"><small>{t('lastActivity')}</small><span>{taskAge(summary.updatedAt)}</span></span></button>{expanded && <div className="dshLiveTeamsTaskDetail">{detail === undefined ? <p>{t('loading')}</p> : <><p>{t('taskAssignee')}: {detail.task.assignee ?? summary.assigneeName ?? '—'}</p>{detail.task.reviewReturn === undefined ? null : <><h4>{t('reviewReturnHeading')}</h4><p className="dshLiveTeamsNotice" role="status" data-review-return-state={detail.task.reviewReturn.state}>{t(reviewReturnKeys[detail.task.reviewReturn.state])}{detail.task.reviewReturn.reason === undefined ? '' : ` — ${detail.task.reviewReturn.reason}`}{detail.task.reviewReturn.leadNotified === true || reviewReturnNoticeClass(detail.task.reviewReturn) === undefined ? null : <span> · {t('reviewReturnLeadPending')}</span>}</p></>}<h4>{t('taskAttempts')}</h4>
+{detail.attempts.length === 0 ? <p>{t('taskNoAttempts')}</p> : <ul className="dshLiveTeamsTaskAttempts">{detail.attempts.map((attempt) => <li key={attempt.id}><strong>{attempt.generation}</strong> — {members.find((entry) => entry.memberId === attempt.memberId)?.displayName ?? attempt.memberId}: {t(attemptStatusKeys[attempt.status])}{attempt.humanIntervenedAt === undefined ? null : <span className="dshLiveTeamsTaskIntervened" title={t('attemptHumanIntervened')}>{t('taskIntervened')}</span>}</li>)}</ul>}{summary.blockedBy === undefined || summary.blockedBy.length === 0 ? null : <><h4>{t('taskBlockedBy')}</h4><ul>{summary.blockedBy.map((blocker) => <li key={blocker.id}>{blocker.title} — {taskStatusLabel(blocker.status, t)}</li>)}</ul></>}<h4>{t('taskAcceptance')}</h4><ul>{detail.task.acceptance.map((item) => <li key={item}>{item}</li>)}</ul><h4>{t('taskDocument')}</h4>{detail.documentMissing === true ? <p>{t('taskDocumentMissing')}</p> : <pre>{detail.document || '—'}</pre>}<h4>{t('taskSubmissions')}</h4><ul>{detail.submissions.map((item) => <li key={item.id}><strong>{item.summary}</strong> — {artifactLabel(item.artifact)}{item.scope === undefined ? null : <span className={`dshLiveTeamsSubmissionScope dshLiveTeamsScope${item.scope.state}`} title={scopeTitle(item.scope, t)}>{t(scopeKeys[item.scope.state])}</span>}<ul>{item.checks.map((check) => <li key={`${item.id}-${check.command}`}>{check.status}: {check.command}</li>)}</ul></li>)}</ul><h4>{t('taskReviewRounds')}</h4><ol>{detail.rounds.map((round) => <li key={round.id}><strong>{round.round}: {round.verdict}</strong><ul>{round.findings.map((finding) => <li key={`${round.id}-${finding.problem}`}>{finding.severity}: {finding.problem}</li>)}</ul><ul>{round.evidence.map((check) => <li key={`${round.id}-${check.command}`}>{check.status}: {check.command}</li>)}</ul></li>)}</ol>
+{(summary.status === 'draft' || summary.status === 'ready') && <div className="dshLiveTeamsTaskActions"><Button variant="outline" size="sm" type="button" disabled={draftBusy} onClick={() => openContract(summary, detail)}>{t('taskEditContract')}</Button>{summary.status === 'draft' && detail.task.assignee !== undefined && detail.task.route !== undefined && detail.task.acceptance.length > 0 && !detail.attempts.some((attempt) => attempt.status === 'active' || attempt.status === 'revoking') && <Button variant="primary" size="sm" type="button" disabled={draftBusy || taskBusy !== null} onClick={() => resumeTask(summary)}>{t('taskResume')}</Button>}</div>}
+{summary.status !== 'completed' && summary.status !== 'cancelled' && <div className="dshLiveTeamsTaskActions">{detail.attempts.some((attempt) => attempt.id === detail.task.activeAttemptId && (attempt.status === 'active' || attempt.status === 'revoking')) && <Button variant="outline" size="sm" type="button" disabled={draftBusy} onClick={() => { setReleaseReason(''); setReleaseTarget(summary) }}>{t('taskRelease')}</Button>}<Button variant="outline" size="sm" type="button" disabled={draftBusy} onClick={() => { setTaskNotice(null); setTaskInstructions(''); setTaskConfirm({ kind: 'cancel', task: summary }) }}>{t('taskClose')}</Button></div>}{canReturn && <div className="dshLiveTeamsTaskActions">{canDecide && detail.documentMissing !== true && <Button variant="primary" size="sm" type="button" onClick={() => { setTaskNotice(null); setTaskNote(''); setTaskConfirm({ kind: 'accept', task: summary }) }}>{t('taskAccept')}</Button>}<Button variant="outline" size="sm" type="button" onClick={() => { setTaskNotice(null); setTaskInstructions(''); setTaskConfirm({ kind: 'revise', task: summary }) }}>{t('taskRevise')}</Button></div>}</>}</div>}</li> })}</ul>}<Modal open={taskDraft !== null} onClose={() => { if (!draftBusy) setTaskDraft(null) }} title={taskDraft?.editing === undefined ? t('taskNewTitle') : t('taskEditTitle')} closeLabel={t('cancel')} description={t('taskDraftDescription')} footer={<><Button variant="outline" size="sm" type="button" disabled={draftBusy} onClick={() => setTaskDraft(null)}>{t('cancel')}</Button><Button variant="primary" size="sm" type="button" disabled={draftBusy || draftTitle.trim().length === 0 || draftAssignee.length === 0 || lines(draftAcceptance).length === 0 || (draftRoute === 'review' && draftReviewer.length === 0)} onClick={saveDraft}>{t('taskSave')}</Button></>}>
+          <div className="dshLiveTeamsModalFields">
+            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskTitleLabel')}</span><input type="text" value={draftTitle} disabled={draftBusy} onChange={(event) => setDraftTitle(event.target.value)} /></label>
+            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskKind')}</span><select value={draftKind} disabled={draftBusy || taskDraft?.editing !== undefined} onChange={(event) => setDraftKind(event.target.value)}>{(['implementation', 'research', 'requirements', 'verification', 'repair', 'integration', 'work'] as const).map((kind) => <option key={kind} value={kind}>{t(`taskKind${kind}` as LocaleKey)}</option>)}</select></label>
+            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskAssignee')}</span><select value={draftAssignee} disabled={draftBusy} onChange={(event) => setDraftAssignee(event.target.value)}><option value="">—</option>{members.map((member) => <option key={member.memberId} value={member.memberId}>{member.displayName}</option>)}</select></label>
+            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskRoute')}</span><select value={draftRoute} disabled={draftBusy} onChange={(event) => setDraftRoute(event.target.value === 'review' ? 'review' : 'report')}><option value="report">{t('taskRouteReport')}</option><option value="review">{t('taskRouteReview')}</option></select></label>
+            {draftRoute === 'review' && <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskReviewer')}</span><select value={draftReviewer} disabled={draftBusy} onChange={(event) => setDraftReviewer(event.target.value)}><option value="">—</option>{members.filter((member) => member.memberId !== draftAssignee).map((member) => <option key={member.memberId} value={member.memberId}>{member.displayName}</option>)}</select></label>}
+            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskPaths')}</span><input type="text" value={draftPaths} disabled={draftBusy} onChange={(event) => setDraftPaths(event.target.value)} /></label>
+            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskAcceptanceLabel')}</span><textarea value={draftAcceptance} disabled={draftBusy} onChange={(event) => setDraftAcceptance(event.target.value)} /></label>
+            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskChecksLabel')}</span><textarea value={draftChecks} disabled={draftBusy} onChange={(event) => setDraftChecks(event.target.value)} /></label>
+            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskBodyLabel')}</span><textarea value={draftBody} disabled={draftBusy} onChange={(event) => setDraftBody(event.target.value)} /></label>
+          </div>
+        </Modal>
+        <Modal open={releaseTarget !== null} onClose={() => { if (!draftBusy) setReleaseTarget(null) }} title={t('taskReleaseTitle')} closeLabel={t('cancel')} description={t('taskReleaseDescription')} footer={<><Button variant="outline" size="sm" type="button" disabled={draftBusy} onClick={() => setReleaseTarget(null)}>{t('cancel')}</Button><Button variant="primary" size="sm" type="button" disabled={draftBusy || releaseReason.trim().length === 0} onClick={releaseAttempt}>{t('taskRelease')}</Button></>}>
+          <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskReleaseReason')}</span><textarea value={releaseReason} disabled={draftBusy} onChange={(event) => setReleaseReason(event.target.value)} /></label>
+        </Modal>
+        <Modal open={taskConfirm !== null} onClose={() => { if (taskBusy === null) setTaskConfirm(null) }} title={taskConfirm?.kind === 'accept' ? t('taskAcceptTitle') : taskConfirm?.kind === 'cancel' ? t('taskCloseTitle') : t('taskReviseTitle')} closeLabel={t('cancel')} description={taskConfirm?.kind === 'accept' ? t('taskAcceptDescription') : taskConfirm?.kind === 'cancel' ? t('taskCloseDescription') : t('taskReviseDescription')} footer={<><Button variant="outline" size="sm" type="button" onClick={() => setTaskConfirm(null)}>{t('cancel')}</Button><Button variant="primary" size="sm" type="button" disabled={taskBusy !== null || ((taskConfirm?.kind === 'revise' || taskConfirm?.kind === 'cancel') && taskInstructions.trim().length === 0)} onClick={() => { if (taskConfirm !== null) runTaskAction(taskConfirm.kind, taskConfirm.task) }}>{taskConfirm?.kind === 'accept' ? t('taskAccept') : taskConfirm?.kind === 'cancel' ? t('taskClose') : t('taskRevise')}</Button></>}>{taskNotice !== null && <p className="dshLiveTeamsMessage">{taskNotice}</p>}{taskConfirm?.kind === 'cancel' ? <label className="dshLiveTeamsModalField">
+<span className="dshLiveTeamsFieldLabel">{t('taskCloseReason')}</span>
+<textarea value={taskInstructions} onChange={(event) => setTaskInstructions(event.target.value)} />
+</label> : taskConfirm?.kind === 'accept' ? <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskAcceptNote')}</span><textarea value={taskNote} onChange={(event) => setTaskNote(event.target.value)} /></label> : <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskReviseInstructions')}</span><textarea value={taskInstructions} onChange={(event) => setTaskInstructions(event.target.value)} /></label>}</Modal></section>)
+  const journalPanel = (<section className="dshLiveTeamsCard dshLiveTeamsJournal" aria-labelledby="dsh-live-teams-journal-title"><div className="dshLiveTeamsCardTitle"><h3 className="dshLiveTeamsCardTitleText" id="dsh-live-teams-journal-title">{t('journalTitle')}</h3><div className="dshLiveTeamsJournalControls"><button className={`dshLiveTeamsInboxButton${attentionWaiting > 0 ? ' dshLiveTeamsInboxButtonUnread' : ''}`} type="button" onClick={() => setInboxExpanded(true)}>{t('messagesTitle')}{attentionWaiting > 0 ? <span className="dshLiveTeamsInboxCount">{attentionWaiting}</span> : null}</button></div><div className="dshLiveTeamsActivityModes" role="group" aria-label={t('journalModes')}>{(['important', 'all', 'technical'] as const).map(mode => <button key={mode} className={`dshLiveTeamsSegmentedButton${activityMode === mode ? ' dshLiveTeamsSegmentedButtonActive' : ''}`} type="button" aria-pressed={activityMode === mode} onClick={() => { setActivityMode(mode); setJournalFilters(new Set(journalCategories)) }}>{t(activityModeKeys[mode])}</button>)}</div><details className="dshLiveTeamsActivityCategories"><summary>{t('journalFilters')}</summary><div className="dshLiveTeamsSegmented dshLiveTeamsJournalFilters" role="group" aria-label={t('journalFilters')}>{journalCategories.map((category) => <button key={category} className={`dshLiveTeamsSegmentedButton dshLiveTeamsJournalFilter dshLiveTeamsJournalFilter-${category}${journalFilters.has(category) ? ' dshLiveTeamsSegmentedButtonActive dshLiveTeamsJournalFilterActive' : ''}`} type="button" aria-pressed={journalFilters.has(category)} onClick={() => toggleJournalFilter(category)}>{t(journalCategoryKeys[category])}<span className="dshLiveTeamsKindCount">{journal.filter((entry) => entry.category === category).length}</span></button>)}</div></details></div>{journalNotice !== null && <p className="dshLiveTeamsNotice" role="status">{journalNotice}</p>}{journalLoading ? <p className="dshLiveTeamsMessage">{t('loading')}</p> : visibleJournal.length === 0 ? (journalNotice === null ? <p className="dshLiveTeamsMessage">{t(journal.length === 0 ? 'journalEmpty' : 'journalNoMatches')}</p> : null) : <ul className="dshLiveTeamsJournalList">{visibleJournal.map((entry) => {
       const expanded = journalExpanded === entry.id
+      const heading = activityHeading(entry)
       return (
         <li className={`dshLiveTeamsJournalRow${expanded ? ' dshLiveTeamsJournalRowOpen' : ''}`} key={entry.id}>
           <button className="dshLiveTeamsJournalLine" type="button" aria-expanded={expanded} onClick={() => {
@@ -1205,16 +1229,17 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
                 void fetchTeamTask(taskId, session).then((detail) => setJournalTask((current) => ({ ...current, [taskId]: detail }))).catch(() => undefined)
               }
             }}>
-            <span className={`dshLiveTeamsJournalIcon dshLiveTeamsJournalIcon-${entry.category}`} aria-hidden="true">●</span>
-            <span className={`dshLiveTeamsJournalKind dshLiveTeamsJournalKind-${entry.category}`}>{entry.kind}</span>
-            <span className="dshLiveTeamsJournalSummary" title={entry.summary}>{entry.summaryParts === undefined ? entry.summary : entry.summaryParts.map((part, index) => part.strong === true ? <strong key={index}>{part.text}</strong> : <span key={index}>{part.text}</span>)}</span>
-            <span className="dshLiveTeamsJournalRefs">{entry.refs.taskTitle !== undefined && <span className="dshLiveTeamsJournalTaskRef">{entry.refs.taskTitle}</span>}{entry.refs.taskId !== undefined && <span className="dshLiveTeamsJournalTaskId">{entry.refs.taskId}</span>}{entry.refs.round === undefined ? null : <span className="dshLiveTeamsJournalRoundRef">{t('journalRound')} {entry.refs.round}</span>}</span>
+            <span className={`dshLiveTeamsJournalIcon dshLiveTeamsJournalIcon-${entry.category}`} aria-hidden="true"><TeamGlyph kind={entry.category === 'message' ? 'message' : entry.category === 'review' ? 'review' : entry.category === 'task' ? 'task' : 'event'} /></span>
+            <span className={`dshLiveTeamsJournalKind dshLiveTeamsJournalKind-${entry.category}`}>{t(journalCategoryKeys[entry.category])}</span>
+            <span className="dshLiveTeamsJournalSummary" title={entry.summary}>{heading.parts === undefined ? heading.summary : heading.parts.map((part, index) => part.strong === true ? <strong key={index}>{part.text}</strong> : <span key={index}>{part.text}</span>)}</span>
+            <span className="dshLiveTeamsJournalRefs">{entry.refs.taskTitle !== undefined && <span className="dshLiveTeamsJournalTaskRef" title={entry.refs.taskTitle}>{entry.refs.taskTitle}</span>}{entry.refs.taskId !== undefined && <span className="dshLiveTeamsJournalTaskId">{entry.refs.taskId}</span>}{entry.refs.round === undefined ? null : <span className="dshLiveTeamsJournalRoundRef">{t('journalRound')} {entry.refs.round}</span>}</span>
             <time className="dshLiveTeamsJournalTime" dateTime={new Date(entry.at).toISOString()}>{formatJournalTime(entry.at)}</time>
-            <span className={`dshLiveTeamsJournalDisclosure${expanded ? ' dshLiveTeamsJournalDisclosureOpen' : ''}`} aria-hidden="true"><IconChevronDownOutline14 size={14} /></span>
+            <span className={`dshLiveTeamsJournalDisclosure${expanded ? ' dshLiveTeamsJournalDisclosureOpen' : ''}`} aria-hidden="true"><IconChevronDown size={14} /></span>
           </button>
           {expanded && (
             <div className="dshLiveTeamsJournalDetailPanel">
-              <dl className="dshLiveTeamsJournalFields">
+              <p className="dshLiveTeamsJournalSourceSummary">{entry.summary}</p>
+              <dl className="dshLiveTeamsJournalFields"><div className="dshLiveTeamsJournalField"><dt>{t('journalEventKind')}</dt><dd><code>{entry.kind}</code></dd></div>{entry.refs.taskId === undefined ? null : <div className="dshLiveTeamsJournalField"><dt>ID</dt><dd>{entry.refs.taskId}</dd></div>}
                 {(entry.fields ?? []).map((field) => (
                   <div className="dshLiveTeamsJournalField" key={`${field.label}:${field.value}`}>
                     <dt>{field.label}</dt>
@@ -1255,8 +1280,27 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
           )}
         </li>
       )
-    })}</ul>}</section>
-      {inboxExpanded && <div className="dshLiveTeamsOverlay" role="presentation" onClick={() => setInboxExpanded(false)}>
+    })}</ul>}</section>)
+  return (
+    <section className="dshLiveTeamsRoot dshLiveTeamsTaskFirst" aria-label={t('title')}>
+      <div className="dshLiveTeamsShell">
+        <div className="dshLiveTeamsHead"><section className="dshLiveTeamsCard dshLiveTeamsSummary" aria-labelledby="dsh-live-teams-summary-title">
+        <div className="dshLiveTeamsSectionHeader">
+          <h2 id="dsh-live-teams-summary-title">{teamState?.teamName ?? snapshot?.teamName ?? t('title')}</h2>
+
+        </div>
+        <dl className="dshLiveTeamsSummaryGrid">
+          <Stat label={t('totalMembers')} value={members.length} />
+          <Stat label={t('liveMembers')} value={liveCount} hidden />
+          <Stat label={t('pausedMembers')} value={pausedCount} hidden={pausedCount === 0} />
+          <Stat label={t('unboundMembers')} value={unboundCount} hidden={unboundCount === 0} />
+           <Stat label={t('activeTasks')} value={activeTaskCount} />
+           <Stat label={t('awaitingLead')} value={awaitingLeadCount} />
+        </dl>
+      <div className="dshLiveTeamsOverviewActions"><button className="dshLiveTeamsIconButton" type="button" onClick={() => refresh()} disabled={loading} aria-label={t('refresh')} title={t('refresh')}><IconRefresh /></button><button className="dshLiveTeamsSettingsToggle" type="button" aria-expanded={settingsOpen} aria-haspopup="dialog" onClick={() => { setExpandedMembers(new Set()); setSettingsOpen(true) }}><TeamGlyph kind="settings" />{t('teamSettings')}</button></div></section></div>
+        {notice !== null && !settingsOpen && selectedMember === undefined && <p className="dshLiveTeamsNotice" role="status">{notice}</p>}
+        <div className="dshLiveTeamsMain">{tasksPanel}{membersPanel}{journalPanel}</div>
+        {inboxExpanded && <div className="dshLiveTeamsOverlay" role="presentation" onClick={() => setInboxExpanded(false)}>
         <div className="dshLiveTeamsDialog" role="dialog" aria-modal="true" aria-label={t('messagesTitle')} onClick={(event) => event.stopPropagation()}>
           <div className="dshLiveTeamsDialogHead">
             <h3 className="dshLiveTeamsDialogTitle">{t('messagesTitle')}</h3>
@@ -1276,34 +1320,81 @@ export function TeamView(props: TeamViewProps): React.ReactElement {
           </div>
         </div>
       </div>}
-         </div>
-         <div className="dshLiveTeamsCol dshLiveTeamsMainRight">
-      <section className="dshLiveTeamsCard dshLiveTeamsTasks dshLiveTeamsListPanel" aria-labelledby="dsh-live-teams-tasks-title"><div className="dshLiveTeamsCardTitle"><h3 className="dshLiveTeamsCardTitleText" id="dsh-live-teams-tasks-title">{t('tasksTitle')}</h3><div className="dshLiveTeamsTaskControls"><button className="dshLiveTeamsTaskNew" type="button" disabled={draftBusy} onClick={openNewTask}>{t('taskNew')}</button><div className="dshLiveTeamsSegmented dshLiveTeamsTaskFilter" role="group" aria-label={t('taskFilters')}>{(['active', 'waiting', 'archived'] as const).map((filter) => <button className={`dshLiveTeamsSegmentedButton dshLiveTeamsTaskFilterButton${taskFilter === filter ? ' dshLiveTeamsSegmentedButtonActive dshLiveTeamsTaskFilterButtonActive' : ''}`} type="button" key={filter} aria-pressed={taskFilter === filter} onClick={() => setTaskFilter(filter)}>{t(taskFilterKeys[filter])}</button>)}</div>{dispatch === null ? null : <button className={`dshLiveTeamsSegmentedButton dshLiveTeamsDispatchToggle${dispatch.paused ? ' dshLiveTeamsDispatchTogglePaused' : ''}`} type="button" disabled={dispatchBusy} aria-pressed={dispatch.paused} title={dispatch.pausedBy === undefined ? t('dispatchPaused') : `${t('dispatchPaused')} · ${t('dispatchPausedBy')}: ${dispatch.pausedBy}`} onClick={toggleDispatch}>{dispatch.paused ? t('dispatchResume') : t('dispatchPause')}</button>}</div></div>{dispatch?.paused === true && <p className="dshLiveTeamsNotice" role="status">{t('dispatchPaused')}{dispatch.pausedReason === undefined ? '' : ` — ${dispatch.pausedReason}`}</p>}{taskNotice !== null && <p className="dshLiveTeamsNotice" role="status">{taskNotice}</p>}{taskLoading && taskSummaries.length === 0 ? <p className="dshLiveTeamsMessage">{t('loading')}</p> : <ul className="dshLiveTeamsTaskList">{taskSummaries.filter((task) => taskMatchesFilter(task, taskFilter)).map((summary) => { const expanded = taskExpanded === summary.id; const detail = taskDetails[summary.id]; const canDecide = summary.status === 'waiting' || summary.status === 'needs_human'; return <li className="dshLiveTeamsTaskRow" key={summary.id}><button className="dshLiveTeamsTaskSummary" type="button" aria-expanded={expanded} onClick={() => expanded ? setTaskExpanded(null) : loadTaskDetail(summary)}><span className={`dshLiveTeamsTaskDisclosure${expanded ? ' dshLiveTeamsTaskDisclosureOpen' : ''}`} aria-hidden="true"><IconChevronDownOutline14 size={14} /></span><span className="dshLiveTeamsTaskStatus">{taskStatusLabel(summary.status, t)}</span><strong className="dshLiveTeamsTaskTitle">{summary.title}</strong><span className="dshLiveTeamsTaskRoute">{routeWords(summary.route)}</span>{summary.blockedBy === undefined || summary.blockedBy.length === 0 ? null : <span className="dshLiveTeamsTaskBlocked" title={blockerWords(summary.blockedBy, t)}>{t('taskBlocked')}</span>}{(() => { const verdict: DispatchTaskVerdict | undefined = dispatch?.tasks.find((entry) => entry.taskId === summary.id); const key = verdict === undefined ? undefined : DISPATCH_CHIP_KEYS[verdict.reason]; return key === undefined ? null : <span className="dshLiveTeamsTaskQueued" title={verdict?.detail}>{t(key)}</span> })()}{(() => { const verdict: DispatchTaskVerdict | undefined = dispatch?.tasks.find((entry) => entry.taskId === summary.id); return verdict?.stalled === undefined ? null : <span className="dshLiveTeamsTaskIntervened" title={verdict.stalled.detail}>{t('taskStalled')}{t(verdict.stalled.reason === 'unacknowledged' ? 'taskStalledUnacknowledged' : 'taskStalledIdle')}</span> })()}<span className="dshLiveTeamsTaskRound">{summary.round === undefined || summary.roundLimit === undefined ? '—' : `${summary.round}/${summary.roundLimit}`}</span><span className="dshLiveTeamsTaskAge">{taskAge(summary.updatedAt)}</span></button>{expanded && <div className="dshLiveTeamsTaskDetail">{detail === undefined ? <p>{t('loading')}</p> : <><p>{t('taskAssignee')}: {detail.task.assignee ?? summary.assigneeName ?? '—'}</p><h4>{t('taskAttempts')}</h4>{detail.attempts.length === 0 ? <p>{t('taskNoAttempts')}</p> : <ul className="dshLiveTeamsTaskAttempts">{detail.attempts.map((attempt) => <li key={attempt.id}><strong>{attempt.generation}</strong> — {members.find((entry) => entry.memberId === attempt.memberId)?.displayName ?? attempt.memberId}: {t(attemptStatusKeys[attempt.status])}{attempt.humanIntervenedAt === undefined ? null : <span className="dshLiveTeamsTaskIntervened" title={t('attemptHumanIntervened')}>{t('taskIntervened')}</span>}</li>)}</ul>}{summary.blockedBy === undefined || summary.blockedBy.length === 0 ? null : <><h4>{t('taskBlockedBy')}</h4><ul>{summary.blockedBy.map((blocker) => <li key={blocker.id}>{blocker.title} — {taskStatusLabel(blocker.status, t)}</li>)}</ul></>}<h4>{t('taskAcceptance')}</h4><ul>{detail.task.acceptance.map((item) => <li key={item}>{item}</li>)}</ul><h4>{t('taskDocument')}</h4>{detail.documentMissing === true ? <p>{t('taskDocumentMissing')}</p> : <pre>{detail.document || '—'}</pre>}<h4>{t('taskSubmissions')}</h4><ul>{detail.submissions.map((item) => <li key={item.id}><strong>{item.summary}</strong> — {artifactLabel(item.artifact)}{item.scope === undefined ? null : <span className={`dshLiveTeamsSubmissionScope dshLiveTeamsScope${item.scope.state}`} title={scopeTitle(item.scope, t)}>{t(scopeKeys[item.scope.state])}</span>}<ul>{item.checks.map((check) => <li key={`${item.id}-${check.command}`}>{check.status}: {check.command}</li>)}</ul></li>)}</ul><h4>{t('taskReviewRounds')}</h4><ol>{detail.rounds.map((round) => <li key={round.id}><strong>{round.round}: {round.verdict}</strong><ul>{round.findings.map((finding) => <li key={`${round.id}-${finding.problem}`}>{finding.severity}: {finding.problem}</li>)}</ul><ul>{round.evidence.map((check) => <li key={`${round.id}-${check.command}`}>{check.status}: {check.command}</li>)}</ul></li>)}</ol>{(summary.status === 'draft' || summary.status === 'ready') && <div className="dshLiveTeamsTaskActions"><Button variant="outline" size="sm" type="button" disabled={draftBusy} onClick={() => openContract(summary, detail)}>{t('taskEditContract')}</Button></div>}{summary.status !== 'completed' && summary.status !== 'cancelled' && summary.status !== 'failed' && summary.status !== 'draft' && <div className="dshLiveTeamsTaskActions"><Button variant="outline" size="sm" type="button" disabled={draftBusy} onClick={() => { setReleaseReason(''); setReleaseTarget(summary) }}>{t('taskRelease')}</Button></div>}{canDecide && <div className="dshLiveTeamsTaskActions">{detail.documentMissing !== true && <Button variant="primary" size="sm" type="button" onClick={() => { setTaskNote(''); setTaskConfirm({ kind: 'accept', task: summary }) }}>{t('taskAccept')}</Button>}<Button variant="outline" size="sm" type="button" onClick={() => { setTaskInstructions(''); setTaskConfirm({ kind: 'revise', task: summary }) }}>{t('taskRevise')}</Button></div>}</>}</div>}</li> })}</ul>}<Modal open={taskDraft !== null} onClose={() => { if (!draftBusy) setTaskDraft(null) }} title={taskDraft?.editing === undefined ? t('taskNewTitle') : t('taskEditTitle')} closeLabel={t('cancel')} description={t('taskDraftDescription')} footer={<><Button variant="outline" size="sm" type="button" disabled={draftBusy} onClick={() => setTaskDraft(null)}>{t('cancel')}</Button><Button variant="primary" size="sm" type="button" disabled={draftBusy || draftTitle.trim().length === 0 || draftAssignee.length === 0 || lines(draftAcceptance).length === 0 || (draftRoute === 'review' && draftReviewer.length === 0)} onClick={saveDraft}>{t('taskSave')}</Button></>}>
-          <div className="dshLiveTeamsModalFields">
-            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskTitleLabel')}</span><input type="text" value={draftTitle} disabled={draftBusy} onChange={(event) => setDraftTitle(event.target.value)} /></label>
-            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskKind')}</span><select value={draftKind} disabled={draftBusy || taskDraft?.editing !== undefined} onChange={(event) => setDraftKind(event.target.value)}>{(['implementation', 'research', 'requirements', 'verification', 'repair', 'integration', 'work'] as const).map((kind) => <option key={kind} value={kind}>{t(`taskKind${kind}` as LocaleKey)}</option>)}</select></label>
-            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskAssignee')}</span><select value={draftAssignee} disabled={draftBusy} onChange={(event) => setDraftAssignee(event.target.value)}><option value="">—</option>{members.map((member) => <option key={member.memberId} value={member.memberId}>{member.displayName}</option>)}</select></label>
-            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskRoute')}</span><select value={draftRoute} disabled={draftBusy} onChange={(event) => setDraftRoute(event.target.value === 'review' ? 'review' : 'report')}><option value="report">{t('taskRouteReport')}</option><option value="review">{t('taskRouteReview')}</option></select></label>
-            {draftRoute === 'review' && <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskReviewer')}</span><select value={draftReviewer} disabled={draftBusy} onChange={(event) => setDraftReviewer(event.target.value)}><option value="">—</option>{members.filter((member) => member.memberId !== draftAssignee).map((member) => <option key={member.memberId} value={member.memberId}>{member.displayName}</option>)}</select></label>}
-            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskPaths')}</span><input type="text" value={draftPaths} disabled={draftBusy} onChange={(event) => setDraftPaths(event.target.value)} /></label>
-            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskAcceptanceLabel')}</span><textarea value={draftAcceptance} disabled={draftBusy} onChange={(event) => setDraftAcceptance(event.target.value)} /></label>
-            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskChecksLabel')}</span><textarea value={draftChecks} disabled={draftBusy} onChange={(event) => setDraftChecks(event.target.value)} /></label>
-            <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskBodyLabel')}</span><textarea value={draftBody} disabled={draftBusy} onChange={(event) => setDraftBody(event.target.value)} /></label>
-          </div>
-        </Modal>
-        <Modal open={releaseTarget !== null} onClose={() => { if (!draftBusy) setReleaseTarget(null) }} title={t('taskReleaseTitle')} closeLabel={t('cancel')} description={t('taskReleaseDescription')} footer={<><Button variant="outline" size="sm" type="button" disabled={draftBusy} onClick={() => setReleaseTarget(null)}>{t('cancel')}</Button><Button variant="primary" size="sm" type="button" disabled={draftBusy || releaseReason.trim().length === 0} onClick={releaseAttempt}>{t('taskRelease')}</Button></>}>
-          <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskReleaseReason')}</span><textarea value={releaseReason} disabled={draftBusy} onChange={(event) => setReleaseReason(event.target.value)} /></label>
-        </Modal>
-        <Modal open={taskConfirm !== null} onClose={() => { if (taskBusy === null) setTaskConfirm(null) }} title={taskConfirm?.kind === 'accept' ? t('taskAcceptTitle') : t('taskReviseTitle')} closeLabel={t('cancel')} description={taskConfirm?.kind === 'accept' ? t('taskAcceptDescription') : t('taskReviseDescription')} footer={<><Button variant="outline" size="sm" type="button" onClick={() => setTaskConfirm(null)}>{t('cancel')}</Button><Button variant="primary" size="sm" type="button" disabled={taskConfirm?.kind === 'revise' && taskInstructions.trim().length === 0} onClick={() => { if (taskConfirm !== null) runTaskAction(taskConfirm.kind, taskConfirm.task) }}>{taskConfirm?.kind === 'accept' ? t('taskAccept') : t('taskRevise')}</Button></>}>{taskConfirm?.kind === 'accept' ? <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskAcceptNote')}</span><textarea value={taskNote} onChange={(event) => setTaskNote(event.target.value)} /></label> : <label className="dshLiveTeamsModalField"><span className="dshLiveTeamsFieldLabel">{t('taskReviseInstructions')}</span><textarea value={taskInstructions} onChange={(event) => setTaskInstructions(event.target.value)} /></label>}</Modal></section>
-         </div>
-       </div>
-     </div>
+        {settingsOpen && <SidePanel title={t('teamSettings')} closeLabel={t('closePanel')} busy={teamBusy} onClose={() => setSettingsOpen(false)}>{settingsPanel}</SidePanel>}
+        {selectedMember !== undefined && <SidePanel title={t('memberSettingsTitle')} closeLabel={t('closePanel')} busy={busy.size > 0 || roleBusy.size > 0 || removeBusy || interruptBusy || grantBusy !== null} onClose={() => setExpandedMembers(new Set())}>{notice !== null && <p className="dshLiveTeamsNotice dshLiveTeamsMemberFeedback" role="status">{notice}</p>}{members.filter((member) => expandedMembers.has(member.memberId)).map((member) => {
+          const rowBusy = busy.has(member.memberId)
+          const editing = editingName === member.memberId
+          const roleInputId = `dsh-live-teams-role-${member.memberId}`
+          const nameInputId = `dsh-live-teams-name-${member.memberId}`
+          const nameErrorId = `${nameInputId}-error`
+          const paused = member.availability === 'paused'
+          return <section className="dshLiveTeamsMemberPanel dshLiveTeamsMemberSettings" data-role={member.role} data-member={member.memberId} aria-label={member.displayName} key={`panel-${member.memberId}`}>
+  <div className="dshLiveTeamsMemberHeading">
+    <RoleAvatar role={member.role} label={roleById.get(member.role)?.name ?? member.role} roles={roleData?.roles ?? []} />
+    <div className="dshLiveTeamsMemberIdentity">{editing ? <><label className="dshLiveTeamsVisuallyHidden" htmlFor={nameInputId}>{t('name')}</label><input ref={nameInputRef} className="dshLiveTeamsNameInput" id={nameInputId} type="text" value={nameDrafts[member.memberId] ?? member.displayName} disabled={rowBusy || removeBusy} aria-invalid={(nameDrafts[member.memberId] ?? '').trim().length === 0} aria-describedby={nameErrorId} onChange={(event) => setNameDrafts((current) => ({ ...current, [member.memberId]: event.target.value }))} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); applyName(member) } else if (event.key === 'Escape') { event.preventDefault(); cancelNameEdit(member) } }} /></> : null}
+{!editing && <Tooltip label={t('openSession')} disabled={member.sessionId === null}><button className="dshLiveTeamsMemberAction" type="button" disabled={member.sessionId === null} onClick={() => openMember(member)}><strong className="dshLiveTeamsMemberName">{member.displayName}</strong></button></Tooltip>}
+{!editing && <button ref={(element) => { nameEditButtons.current[member.memberId] = element }} className="dshLiveTeamsEditNameButton" type="button" disabled={rowBusy || removeBusy} onClick={() => beginNameEdit(member)} aria-label={t('editName')} title={t('editName')}><IconEdit size={14} /></button>}
+{editing && <div className="dshLiveTeamsNameActions"><Button variant="outline" size="sm" type="button" disabled={rowBusy || removeBusy || (nameDrafts[member.memberId] ?? '').trim().length === 0} onClick={() => applyName(member)}>{t('save')}</Button><Button variant="outline" size="sm" type="button" disabled={rowBusy || removeBusy} onClick={() => cancelNameEdit(member)}>{t('cancel')}</Button></div>}
+<span className="dshLiveTeamsState">
+                  <span className="dshLiveTeamsStateDot"><StateDot state={stateDot(member)} /></span>
+                  <span className="dshLiveTeamsStateLabel">{stateText(member, t)}</span>
+                </span><span className="dshLiveTeamsMemberRoleCaption">{roleById.get(member.role)?.name ?? member.role}</span></div>
+  </div>
+  {editing && (nameDrafts[member.memberId] ?? '').trim().length === 0 && <p className="dshLiveTeamsFieldError" id={nameErrorId}>{t('nameRequired')}</p>}
+  <section className="dshLiveTeamsMemberSection" data-member-section="role" aria-label={t('memberRoleHeading')}>
+    <h4>{t('memberRoleHeading')}</h4><p className="dshLiveTeamsSectionHint">{t('memberRoleHint')}</p>
+    <div className="dshLiveTeamsControls">
+              <div className="dshLiveTeamsRoleField">
+                <label className="dshLiveTeamsFieldLabel" htmlFor={roleInputId}>{t('role')}</label>
+                <select className="dshLiveTeamsRoleInput" id={roleInputId} value={roleDrafts[member.memberId] ?? member.role} disabled={rowBusy || removeBusy || roleLoading} onChange={(event) => setRoleDrafts((current) => ({ ...current, [member.memberId]: event.target.value }))}><option value={member.role}>{roleById.has(member.role) ? roleById.get(member.role)?.name : `${member.role} (${t('unknownRole')})`}</option>{roleOptions.filter((role) => role.id !== member.role).map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}</select>
+              </div>
+              <Button variant="outline" size="sm" className="dshLiveTeamsApply" type="button" disabled={rowBusy || removeBusy} onClick={() => applyRole(member)}>{t('apply')}</Button>
+            </div>
+    {(roleDrafts[member.memberId] ?? member.role) !== member.role && <p className="dshLiveTeamsDraftHint">{t('memberRolePending')}</p>}
+    {roleById.get(roleDrafts[member.memberId] ?? member.role)?.description && <p className="dshLiveTeamsSectionHint">{roleById.get(roleDrafts[member.memberId] ?? member.role)?.description}</p>}
   </section>
+  <section className="dshLiveTeamsMemberSection" data-member-section="availability" aria-label={t('memberAvailabilityHeading')}>
+    <h4>{t('memberAvailabilityHeading')}</h4><p className="dshLiveTeamsSectionHint">{t('memberAvailabilityHint')}</p>
+    <div className="dshLiveTeamsMemberActions"><Tag className="dshLiveTeamsAvailabilityTag" tone="neutral">{paused ? t('pausedState') : member.availability === 'available' ? t('available') : member.availability}</Tag>
+<button className="dshLiveTeamsIconButton dshLiveTeamsAvailabilityAction" type="button" disabled={rowBusy || removeBusy} onClick={() => toggleAvailability(member)} aria-label={paused ? t('memberResumeAssignments') : t('memberPauseAssignments')} title={paused ? t('memberResumeAssignments') : t('memberPauseAssignments')}>
+                  {paused ? <IconPlay size={14} /> : <IconPause size={14} />}<span>{paused ? t('memberResumeAssignments') : t('memberPauseAssignments')}</span>
+                </button></div>
+  </section>
+  <section className="dshLiveTeamsMemberSection" data-member-section="contacts" aria-label={t('permittedContacts')}><div className="dshLiveTeamsContactGrant">
+              <h4>{t('permittedContacts')}</h4>
+              <div className="dshLiveTeamsContactChips">{member.permittedContacts === undefined ? <p className="dshLiveTeamsSectionHint">{t('memberContactsUnknown')}</p> : member.permittedContacts.length === 0 ? <p className="dshLiveTeamsSectionHint">{t('noPeerContact')}</p> : member.permittedContacts.map((contact, index) => <span className="dshLiveTeamsContactChip" key={`${contact}:${index}`} title={contact}>{contact === 'team' ? t('memberContactTeam') : contact === 'human' ? t('memberContactHuman') : members.find(candidate => candidate.memberId === contact)?.displayName ?? contact}</span>)}</div>
+              {member.memberId === leadMemberId && <div className="dshLiveTeamsGrantControls">
+                <select className="dshLiveTeamsRoleInput dshLiveTeamsContactSelect" aria-label={t('memberContactTarget')} value={grantTarget} disabled={grantBusy !== null} onChange={(event) => setGrantTarget(event.target.value)}><option value="">{t('chooseContact')}</option>{members.filter((candidate) => candidate.memberId !== member.memberId).map((candidate) => <option key={candidate.memberId} value={candidate.memberId}>{candidate.displayName}</option>)}<option value="team">{t('memberContactTeam')}</option><option value="human">{t('memberContactHuman')}</option></select>
+                <Button variant="outline" size="sm" type="button" disabled={grantBusy !== null || (grantTarget).length === 0} onClick={() => { const allow = grantTarget; setGrantBusy(member.memberId); void grantTeamContact({ memberId: member.memberId, allow, action: 'add' }, session).then(() => refresh()).catch((cause: unknown) => setNotice(cause instanceof LiveTeamsApiError ? cause.error : t('grantFailed'))).finally(() => setGrantBusy(null)) }}>{t('grant')}</Button>
+                <Button variant="outline" size="sm" type="button" disabled={grantBusy !== null || (grantTarget).length === 0} onClick={() => { const allow = grantTarget; setGrantBusy(member.memberId); void grantTeamContact({ memberId: member.memberId, allow, action: 'remove' }, session).then(() => refresh()).catch((cause: unknown) => setNotice(cause instanceof LiveTeamsApiError ? cause.error : t('grantFailed'))).finally(() => setGrantBusy(null)) }}>{t('revoke')}</Button>
+              </div>}
+              {/* An absent control reads as a missing feature; say who owns it instead. */}
+              {member.memberId !== leadMemberId && <span className="dshLiveTeamsFieldLabel">{t('contactGrantLeadOnly')}</span>}
+            </div></section>
+  <section className="dshLiveTeamsMemberSection" data-member-section="session" aria-label={t('memberSessionHeading')}>
+    <h4>{t('memberSessionHeading')}</h4>
+    <div className="dshLiveTeamsMemberSessionActions"><span className="dshLiveTeamsBindingTag">{bindingLabel(member, t)}</span>{!editing && <button className="dshLiveTeamsMemberOpen" type="button" disabled={member.sessionId === null} title={t('openSession')} onClick={() => openMember(member)}>{t('openSessionAction')}</button>}</div>
+    <div className="dshLiveTeamsMemberTurnControl">{!editing && member.status === 'running' && <button className="dshLiveTeamsInterruptButton" type="button" disabled={rowBusy || removeBusy || interruptBusy} onClick={() => setInterruptTarget(member)} aria-label={`${t('interruptTurn')}: ${member.displayName}`} title={t('interruptTurn')}>{t('interruptTurn')}</button>}
+      <p className="dshLiveTeamsSectionHint">{member.status === 'running' ? editing ? t('memberFinishNameFirst') : t('interruptTurnKeeps') : member.status === 'unknown' ? t('memberTurnUnknown') : t('noRunningTurn')}</p>
+    </div>
+  </section>
+  {member.note?.trim() && <section className="dshLiveTeamsMemberSection" data-member-section="note"><h4>{t('note')}</h4><p className="dshLiveTeamsMemberNoteText">{member.note}</p></section>}
+  <details className="dshLiveTeamsMemberTechnical" data-member-section="technical"><summary>{t('memberTechnicalDetails')}</summary><dl className="dshLiveTeamsMemberMeta">
+    <div><dt>{t('memberIdentifier')}</dt><dd><code>{member.memberId}</code></dd></div>
+    <div><dt>{t('memberSessionIdentifier')}</dt><dd><code>{member.sessionId ?? t('unbound')}</code></dd></div>
+    <div><dt>{t('memberBindingGeneration')}</dt><dd>{member.bindingGeneration}</dd></div>
+    <div><dt>{t('memberContractRevision')}</dt><dd>{member.contractRevision}</dd></div>
+  </dl></details>
+  <section className="dshLiveTeamsMemberRemoval" data-member-section="removal" aria-label={t('removeMember')}><h4>{t('removeMember')}</h4><p className="dshLiveTeamsSectionHint">{t('sessionContinues')}</p><button className="dshLiveTeamsMemberRemove" type="button" disabled={rowBusy || removeBusy || interruptBusy} onClick={() => setRemoveTarget(member)} aria-label={`${t('removeMember')}: ${member.displayName}`} title={t('removeMember')}>{t('removeMember')}</button></section>
+</section>
+        })}</SidePanel>}
+      </div>
+    </section>
   )
 }
 
-function Stat(props: { readonly label: string; readonly value: number }): React.ReactElement {
-  return <div className="dshLiveTeamsStat"><dt className="dshLiveTeamsStatLabel">{props.label}</dt><dd className="dshLiveTeamsStatValue">{props.value}</dd></div>
+function Stat(props: { readonly label: string; readonly value: number; readonly hidden?: boolean }): React.ReactElement {
+  return <div className="dshLiveTeamsStat" hidden={props.hidden}><dt className="dshLiveTeamsStatLabel">{props.label}</dt><dd className="dshLiveTeamsStatValue">{props.value}</dd></div>
 }
 
 export default TeamView

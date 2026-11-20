@@ -1,5 +1,5 @@
 import { MemberRecord, TeamState } from "./team-store.js";
-import { TeamTask } from "./task-store.js";
+import { TaskAttempt, TeamTask } from "./task-store.js";
 import { LiveTeamsRole } from "./roles.js";
 //#region src/context-provider.d.ts
 export declare const MEMBERSHIP_CONTEXT_NAME = "live-teams:membership";
@@ -25,7 +25,18 @@ export type MembershipScope = {
   roleRegistry?: RoleRegistrySync;
   teamState?: TeamState;
   workspacePath?: string;
+  /** The model driving this Session, when the host can tell us. */
+  route?: string;
   live?: (member: MemberRecord) => boolean;
+  /**
+   * The model driving this member's Session, when it can be read.
+   *
+   * The tool names a member sees depend on the route: a Session on `claude-code/*` reaches the team
+   * tools through the MCP bridge of `dsh-oh-my-claude`, where they are `mcp__dsh__live_team_*`. A
+   * context that names them without the prefix asks the model to translate, and the `ToolSearch`
+   * line that loads their schemas needs the exact names.
+   */
+  routeOf?: (member: MemberRecord) => string | undefined;
   /**
    * Comments addressed to this member that it has not acknowledged. A comment is stored with
    * `wakePolicy: never`, so nothing wakes the Session for it — without this line the recipient never
@@ -41,11 +52,7 @@ export declare function renderMembership(member: MembershipMember, scope: Member
 type SyncStore = {
   memberBySessionSync: (teamId: string, sessionId: string) => MembershipMember | undefined;
   teamStateSync?: (teamId: string) => TeamState | undefined;
-  attemptSync?: (teamId: string, taskId: string) => {
-    humanIntervenedAt?: number;
-    humanIntervenedContractRevision?: number;
-    generation: number;
-  } | undefined;
+  attemptSync?: (teamId: string, taskId: string) => Pick<TaskAttempt, 'id' | 'memberId' | 'sessionId' | 'bindingGeneration' | 'status' | 'humanIntervenedAt' | 'humanIntervenedContractRevision' | 'generation'> | undefined;
   activeTaskForMemberSync?: (teamId: string, memberId: string) => TeamTask | undefined;
   tasksSync?: (teamId: string) => readonly TeamTask[] | undefined;
 };
@@ -59,17 +66,15 @@ export type MembershipContextBinding = {
   readonly live?: (member: MemberRecord) => boolean;
   readonly activeTaskForMemberSync?: (teamId: string, memberId: string) => TeamTask | undefined;
   readonly tasksSync?: (teamId: string) => readonly TeamTask[] | undefined;
-  readonly attemptSync?: (teamId: string, taskId: string) => {
-    humanIntervenedAt?: number;
-    humanIntervenedContractRevision?: number;
-    generation: number;
-  } | undefined;
+  readonly attemptSync?: (teamId: string, taskId: string) => Pick<TaskAttempt, 'id' | 'memberId' | 'sessionId' | 'bindingGeneration' | 'status' | 'humanIntervenedAt' | 'humanIntervenedContractRevision' | 'generation'> | undefined;
   /** Unread comments for a member, read synchronously because the context is assembled that way. */
   readonly commentsSync?: (teamId: string, memberId: string) => readonly {
     from: string;
     content: string;
     at: number;
   }[];
+  /** The model driving a member's Session, read synchronously because the context is assembled that way. */
+  readonly routeOf?: (member: MemberRecord) => string | undefined;
 };
 export type MembershipContextOptions = {
   readonly store?: SyncStore;
@@ -84,16 +89,13 @@ export type MembershipContextOptions = {
   readonly live?: (member: MemberRecord) => boolean;
   readonly activeTaskForMemberSync?: (teamId: string, memberId: string) => TeamTask | undefined;
   readonly tasksSync?: (teamId: string) => readonly TeamTask[] | undefined;
-  readonly attemptSync?: (teamId: string, taskId: string) => {
-    humanIntervenedAt?: number;
-    humanIntervenedContractRevision?: number;
-    generation: number;
-  } | undefined;
+  readonly attemptSync?: (teamId: string, taskId: string) => Pick<TaskAttempt, 'id' | 'memberId' | 'sessionId' | 'bindingGeneration' | 'status' | 'humanIntervenedAt' | 'humanIntervenedContractRevision' | 'generation'> | undefined;
   readonly commentsSync?: (teamId: string, memberId: string) => readonly {
     from: string;
     content: string;
     at: number;
   }[];
+  readonly routeOf?: (member: MemberRecord) => string | undefined;
 };
 export type MembershipContextProvider = {
   name: string;

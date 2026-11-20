@@ -1,8 +1,8 @@
 import { MailboxService, MessageDelivery, MessageKind, TeamMessage } from "./mailbox.js";
 import { MemberRecord, TeamState } from "./team-store.js";
 import { ReadTaskResult, TaskStore, TeamTask } from "./task-store.js";
-import { DispatchEvaluation } from "./dispatch.js";
 import { SessionDescriptor } from "./session-bridge.js";
+import { DispatchEvaluation } from "./dispatch.js";
 import { RoleRegistry } from "./roles.js";
 //#region src/routes.d.ts
 export declare const LIVE_TEAMS_MEMBERS_ROUTE = "/api/live-teams/members";
@@ -33,7 +33,11 @@ export declare const LIVE_TEAMS_DISPATCH_ROUTE = "/api/live-teams/dispatch";
 export declare const LIVE_TEAMS_TASKS_ROUTE = "/api/live-teams/tasks";
 export declare const LIVE_TEAMS_TASK_ROUTE = "/api/live-teams/task";
 export declare const LIVE_TEAMS_TASK_ACCEPT_ROUTE = "/api/live-teams/task/accept";
+export declare const LIVE_TEAMS_TASK_NOTIFY_SUBMISSION_ROUTE = "/api/live-teams/task/notify-submission";
+export declare const LIVE_TEAMS_TASK_NOTIFY_REVIEW_ROUTE = "/api/live-teams/task/notify-review";
 export declare const LIVE_TEAMS_TASK_REVISE_ROUTE = "/api/live-teams/task/revise";
+export declare const LIVE_TEAMS_TASK_CANCEL_ROUTE = "/api/live-teams/task/cancel";
+export declare const LIVE_TEAMS_TASK_RESUME_ROUTE = "/api/live-teams/task/resume";
 /** The human's own control over work: create it, change its contract, release a held attempt. */
 export declare const LIVE_TEAMS_TASK_CREATE_ROUTE = "/api/live-teams/task/create";
 export declare const LIVE_TEAMS_TASK_UPDATE_ROUTE = "/api/live-teams/task/update";
@@ -186,6 +190,11 @@ export type LiveTeamsAuditRecord = {
   readonly actor: MutationActor;
   readonly at: number;
 } | {
+  /** The lead name was cleared; there is no member to name. */
+  readonly kind: 'team/lead-cleared';
+  readonly actor: MutationActor;
+  readonly at: number;
+} | {
   readonly kind: 'member/interrupted';
   readonly memberId: string;
   readonly sessionId: string;
@@ -330,9 +339,12 @@ export type LiveTeamsTaskRouteSummary = {
   readonly description: string;
 };
 export type LiveTeamsTaskSummary = {
+  readonly reviewReturn?: NonNullable<TeamTask['reviewReturn']>;
   readonly id: string;
   readonly title: string;
   readonly status: TeamTask['status'];
+  /** A submission is in and nobody has decided on it: the lead or the human owes an accept or a return. */
+  readonly awaitsDecision?: boolean;
   readonly assignee?: string;
   readonly assigneeName?: string;
   readonly route?: LiveTeamsTaskRouteSummary;
@@ -457,9 +469,10 @@ export type LiveTeamsRouteOptions = {
   readonly compatibility?: () => LiveTeamsTeamStatus['compatibility'];
   /** Durable B19-B22 task store for the human task surface. */
   readonly taskStore?: TaskStore;
-  readonly setLead?: (memberId: string, expectedRevision: number) => Promise<{
+  /** `undefined` clears the name; the team falls back to whoever holds the `lead` role. */
+  readonly setLead?: (memberId: string | undefined, expectedRevision: number) => Promise<{
     state: TeamState;
-    leadMemberId: string;
+    leadMemberId?: string;
   }>;
   readonly setContactGrant?: (from: string, to: string, action: 'add' | 'remove', actor: string) => Promise<{
     grants: {
@@ -580,7 +593,7 @@ export declare function actorOf(context: {
  * since 11:33" is the number that matters, not the newest.
  */
 export declare function projectLiveTeamsAttention(state: TeamState, messages: readonly TeamMessage[], deliveries: readonly MessageDelivery[]): LiveTeamsAttention;
-export declare function projectLiveTeamsSnapshot(state: TeamState, options: Pick<LiveTeamsRouteOptions, 'teamId' | 'teamName' | 'workspacePath' | 'agents'>): LiveTeamsSnapshot;
+export declare function projectLiveTeamsSnapshot(state: TeamState, options: Pick<LiveTeamsRouteOptions, 'teamId' | 'teamName' | 'workspacePath' | 'agents'>, tasks?: readonly TeamTask[]): LiveTeamsSnapshot;
 export declare function projectLiveTeamsCandidates(state: TeamState, descriptors: readonly SessionDescriptor[], options: Pick<LiveTeamsRouteOptions, 'teamId' | 'teamName' | 'workspacePath'>): LiveTeamsCandidates;
 export declare function registerLiveTeamsRoutes(ctx: LiveTeamsRouteContext, options: LiveTeamsRouteOptions): () => void;
 //#endregion

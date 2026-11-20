@@ -10,8 +10,10 @@ import type { RoleRegistry } from './roles.js'
 import { messageDeliveryOutcome, type MailboxService, type MessageKind, type TeamMessage } from './mailbox.js'
 import type { MessageDelivery } from './mailbox.js'
 import { resolveLeadMemberId } from './team-store.js'
+import { permittedContacts } from './task-store.js'
 import { blockedBy, type CreateTaskRequest, type ReadTaskResult, type TaskRoute, type TaskStore, type TeamTask } from './task-store.js'
 import type { DispatchEvaluation } from './dispatch.js'
+import { parseReviewReturn } from './review-return-state.js'
 
 export const LIVE_TEAMS_MEMBERS_ROUTE = '/api/live-teams/members'
 export const LIVE_TEAMS_CANDIDATES_ROUTE = '/api/live-teams/candidates'
@@ -41,7 +43,11 @@ export const LIVE_TEAMS_DISPATCH_ROUTE = '/api/live-teams/dispatch'
 export const LIVE_TEAMS_TASKS_ROUTE = '/api/live-teams/tasks'
 export const LIVE_TEAMS_TASK_ROUTE = '/api/live-teams/task'
 export const LIVE_TEAMS_TASK_ACCEPT_ROUTE = '/api/live-teams/task/accept'
+export const LIVE_TEAMS_TASK_NOTIFY_SUBMISSION_ROUTE = '/api/live-teams/task/notify-submission'
+export const LIVE_TEAMS_TASK_NOTIFY_REVIEW_ROUTE = '/api/live-teams/task/notify-review'
 export const LIVE_TEAMS_TASK_REVISE_ROUTE = '/api/live-teams/task/revise'
+export const LIVE_TEAMS_TASK_CANCEL_ROUTE = '/api/live-teams/task/cancel'
+export const LIVE_TEAMS_TASK_RESUME_ROUTE = '/api/live-teams/task/resume'
 /** The human's own control over work: create it, change its contract, release a held attempt. */
 export const LIVE_TEAMS_TASK_CREATE_ROUTE = '/api/live-teams/task/create'
 export const LIVE_TEAMS_TASK_UPDATE_ROUTE = '/api/live-teams/task/update'
@@ -197,6 +203,11 @@ export type LiveTeamsAuditRecord = {
   readonly actor: MutationActor
   readonly at: number
 } | {
+  /** The lead name was cleared; there is no member to name. */
+  readonly kind: 'team/lead-cleared'
+  readonly actor: MutationActor
+  readonly at: number
+} | {
   readonly kind: 'member/interrupted'
   readonly memberId: string
   readonly sessionId: string
@@ -336,9 +347,12 @@ export type LiveTeamsTaskRouteSummary =
   | { readonly type: 'custom'; readonly description: string }
 
 export type LiveTeamsTaskSummary = {
+  readonly reviewReturn?: NonNullable<TeamTask['reviewReturn']>
   readonly id: string
   readonly title: string
   readonly status: TeamTask['status']
+  /** A submission is in and nobody has decided on it: the lead or the human owes an accept or a return. */
+  readonly awaitsDecision?: boolean
   readonly assignee?: string
   readonly assigneeName?: string
   readonly route?: LiveTeamsTaskRouteSummary
@@ -432,7 +446,8 @@ export type LiveTeamsRouteOptions = {
   readonly compatibility?: () => LiveTeamsTeamStatus['compatibility']
   /** Durable B19-B22 task store for the human task surface. */
   readonly taskStore?: TaskStore
-  readonly setLead?: (memberId: string, expectedRevision: number) => Promise<{ state: TeamState; leadMemberId: string }>
+  /** `undefined` clears the name; the team falls back to whoever holds the `lead` role. */
+  readonly setLead?: (memberId: string | undefined, expectedRevision: number) => Promise<{ state: TeamState; leadMemberId?: string }>
   readonly setContactGrant?: (from: string, to: string, action: 'add' | 'remove', actor: string) => Promise<{ grants: { from: string; to: string; grantedBy: string; at: number }[] }>
   /** Read the dispatch projection; never mutates and never creates a team. */
   readonly readDispatch?: () => Promise<LiveTeamsDispatch | undefined>
@@ -777,7 +792,7 @@ function teamNameOf(state: Pick<TeamState, 'name' | 'teamId'>, options: Pick<Liv
   return configured === undefined || configured.length === 0 ? state.teamId : configured
 }
 
-export function projectLiveTeamsSnapshot(state: TeamState, options: Pick<LiveTeamsRouteOptions, 'teamId' | 'teamName' | 'workspacePath' | 'agents'>): LiveTeamsSnapshot {
+export function projectLiveTeamsSnapshot(state: TeamState, options: Pick<LiveTeamsRouteOptions, 'teamId' | 'teamName' | 'workspacePath' | 'agents'>, tasks: readonly TeamTask[] = []): LiveTeamsSnapshot {
   const checked = stateOf(state, options)
   const members = checked.members
     .map((member) => {
@@ -788,7 +803,9 @@ export function projectLiveTeamsSnapshot(state: TeamState, options: Pick<LiveTea
         memberId: member.memberId,
         // Names, not ids: this list is read by the human in the tab, and a raw
         // member id tells them nothing. Unknown ids keep their id rather than vanish.
-        permittedContacts: [checked.leadMemberId ?? '', ...(checked.contactGrants ?? []).filter((grant) => grant.from === member.memberId).map((grant) => grant.to)]
+        // The same rule the mailbox enforces: a narrower list here told the lead that contact with
+        // colleagues was not allowed while its messages were being delivered to all of them.
+        permittedContacts: permittedContacts(checked, member.memberId, tasks)
           .filter((value, index, values) => value.length > 0 && values.indexOf(value) === index)
           .map((target) => target === 'human' || target === 'team'
             ? target
@@ -1753,6 +1770,8 @@ function taskSummary(task: TeamTask, state: TeamState, tasks: readonly TeamTask[
     id: task.id,
     title: task.title,
     status: task.status,
+    ...(task.awaitsDecision === true ? { awaitsDecision: true } : {}),
+    ...(task.reviewReturn === undefined ? {} : { reviewReturn: parseReviewReturn(task.reviewReturn) }),
     ...(task.assignee === undefined ? {} : { assignee: task.assignee }),
     ...(assignee === undefined ? {} : { assigneeName: assignee.displayName }),
     ...(route === undefined ? {} : { route }),
@@ -1819,6 +1838,11 @@ function journalSummary(recordValue: Record<string, unknown>, kind: string, acto
     const id = journalText(value)
     return id === undefined ? undefined : nameOf(id)
   }
+  if (kind === 'review/returned') {
+    const labels: Record<string, string> = { pending: 'review return queued', sending: 'review notification delivery pending', delivered: 'review notification delivered; launch unconfirmed', started: 'Session launch confirmed', completed: 'Session processed review request (not acceptance)', blocked: 'automatic review return blocked', failed: 'review return or launch failed', unconfirmed: 'Session launch unconfirmed', superseded: 'review return no longer current' }
+    return `${actor}${labels[String(recordValue.state)] ?? 'review return state unknown'}${task === undefined ? '' : ` · ${task}`}`
+  }
+  if (kind === 'review/lead-notified') return `${actor}lead notified of review return${task === undefined ? '' : ` · ${task}`}`
   if (kind === 'message/sent') return `${actor}sent ${journalText(recordValue.messageKind) ?? 'message'} to ${who(recordValue.to) ?? 'the team'}`
   if (kind.startsWith('delivery/')) {
     // "delivered message 1dae64e3-…" tells a person nothing. The recipient is in the event and the
@@ -1896,6 +1920,10 @@ function projectJournal(events: readonly unknown[], state: TeamState, limit: num
       if (id !== undefined) fields.push({ label, value: id })
     }
     if (round !== undefined) fields.push({ label: 'Round', value: String(round) })
+    if (kind === 'review/returned' || kind === 'review/lead-notified') {
+      if (journalText(value.state) !== undefined) fields.push({ label: 'Return state', value: String(value.state) })
+      for (const [label, field] of [['Review', 'roundId'], ['Request', 'requestId'], ['Turn', 'turn'], ['Input seq', 'inputSeq']] as const) if (typeof value[field] === 'string' || typeof value[field] === 'number') fields.push({ label, value: String(value[field]) })
+    }
     const verdict = journalText(value.verdict)
     if (verdict !== undefined) fields.push({ label: 'Verdict', value: verdict })
     const reason = journalText(value.reason) ?? journalText(value.detail) ?? journalText(value.note)
@@ -2126,7 +2154,7 @@ function stringList(value: unknown): string[] | undefined {
   return Array.isArray(value) && value.every((entry) => typeof entry === 'string') ? value as string[] : undefined
 }
 
-async function handleTaskMutation(request: LiveTeamsRequest, response: LiveTeamsResponse, ctx: LiveTeamsRouteContext, options: LiveTeamsRouteOptions, operation: 'accept' | 'revise'): Promise<void> {
+async function handleTaskMutation(request: LiveTeamsRequest, response: LiveTeamsResponse, ctx: LiveTeamsRouteContext, options: LiveTeamsRouteOptions, operation: 'accept' | 'revise' | 'cancel' | 'resume' | 'notify-submission' | 'notify-review'): Promise<void> {
   if (!authorityAllowed(request, ctx.webServer.port)) { sendJson(response, 403, { error: 'live-teams request authority rejected' }); return }
   if (request.method !== 'POST' || bodyContentType(request) !== 'application/json') { sendJson(response, request.method === 'POST' ? 400 : 405, { error: request.method === 'POST' ? 'live-teams invalid request' : 'live-teams method not allowed' }); return }
   let body: Record<string, unknown>
@@ -2135,17 +2163,36 @@ async function handleTaskMutation(request: LiveTeamsRequest, response: LiveTeams
   const sessionId = requiredText(body.sessionId)
   const note = body.note
   const instructions = body.instructions
+  const reason = body.reason
+  const expectedRevision = body.expectedRevision
+  if (expectedRevision !== undefined && (typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0)) { sendJson(response, 400, { error: 'live-teams invalid revision' }); return }
+  if (operation === 'cancel' && (typeof reason !== 'string' || reason.trim().length === 0)) { sendJson(response, 400, { error: 'live-teams invalid request' }); return }
+  if (operation === 'notify-submission' && requiredText(body.submissionId) === undefined) { sendJson(response, 400, { error: 'live-teams invalid request' }); return }
+  if (operation === 'notify-review' && requiredText(body.roundId) === undefined) { sendJson(response, 400, { error: 'live-teams invalid request' }); return }
   if (taskId === undefined || sessionId === undefined || operation === 'revise' && (typeof instructions !== 'string' || instructions.trim().length === 0) || operation === 'accept' && note !== undefined && typeof note !== 'string') {
     sendJson(response, 400, { error: 'live-teams invalid request' }); return
   }
   await withResolvedOptions(request, response, options, async (resolved) => {
     if (resolved.taskStore === undefined) { sendJson(response, 503, { error: 'live-teams state unavailable' }); return }
     try {
-      if (operation === 'accept') {
+      if (operation === 'notify-review') {
+        const notifications = await resolved.taskStore.requestReviewNotification(taskId, requiredText(body.roundId)!, actorFor(request, ctx.webServer.port))
+        sendJson(response, 200, { notifications })
+      } else if (operation === 'notify-submission') {
+        const notifications = await resolved.taskStore.requestSubmissionNotification(taskId, requiredText(body.submissionId)!, actorFor(request, ctx.webServer.port))
+        sendJson(response, 200, { notifications })
+      } else if (operation === 'cancel') {
+        const result = await resolved.taskStore.cancelTask({ taskId, actor: actorFor(request, ctx.webServer.port), reason: (reason as string).trim(), ...(expectedRevision === undefined ? {} : { expectedRevision: expectedRevision as number }) })
+        sendJson(response, 200, result)
+      } else if (operation === 'resume') {
+        sendJson(response, 200, await resolved.taskStore.resumeTask({ taskId, actor: actorFor(request, ctx.webServer.port), ...(expectedRevision === undefined ? {} : { expectedRevision: expectedRevision as number }) }))
+      } else if (operation === 'accept') {
         const result = await resolved.taskStore.acceptTask({ taskId, actor: actorFor(request, ctx.webServer.port), ...(note === undefined ? {} : { note: note as string }) })
         sendJson(response, 200, result)
       } else {
         const result = await resolved.taskStore.reviseTask({ taskId, actor: actorFor(request, ctx.webServer.port), instructions: instructions as string })
+        // TaskStore owns direction delivery for both lead tools and the panel. Sending
+        // it again here would enqueue a second wake-up after the same durable revision.
         sendJson(response, 200, result)
       }
     } catch (error) { sendJson(response, taskErrorStatus(error), taskErrorBody(error)) }
@@ -2166,15 +2213,23 @@ async function handleTeamLead(request: LiveTeamsRequest, response: LiveTeamsResp
   }
   if (request.method !== 'POST' || bodyContentType(request) !== 'application/json') { sendJson(response, request.method === 'POST' ? 400 : 405, { error: request.method === 'POST' ? 'live-teams invalid request' : 'live-teams method not allowed' }); return }
   let memberId: string | undefined
-  try { const body = record(JSON.parse(await requestBody(request)) as unknown); memberId = requiredText(body.memberId); if (memberId === undefined || body.sessionId === undefined) throw new Error('invalid lead') } catch { sendJson(response, 400, { error: 'live-teams invalid request' }); return }
+  // An empty string is the panel's "Not set" and means clear; a missing field is a malformed request.
+  try {
+    const body = record(JSON.parse(await requestBody(request)) as unknown)
+    if (body.sessionId === undefined) throw new Error('invalid lead')
+    if (typeof body.memberId !== 'string') throw new Error('invalid lead')
+    memberId = body.memberId.length === 0 ? undefined : requiredText(body.memberId)
+  } catch { sendJson(response, 400, { error: 'live-teams invalid request' }); return }
   try {
     const state = await readTeamState(options)
-    if (!state.members.some((member) => member.memberId === memberId)) { sendJson(response, 400, { error: 'live-teams invalid request' }); return }
+    if (memberId !== undefined && !state.members.some((member) => member.memberId === memberId)) { sendJson(response, 400, { error: 'live-teams invalid request' }); return }
     if (options.setLead === undefined) { sendJson(response, 500, { error: 'live-teams mutation failed' }); return }
     const expectedRevision = state.revision
     const result = await options.setLead(memberId, expectedRevision)
-    await options.appendAudit?.({ kind: 'team/lead', memberId, actor: actorFor(request, ctx.webServer.port), at: Date.now() })
-    sendJson(response, 200, { leadMemberId: result.leadMemberId })
+    await options.appendAudit?.(memberId === undefined
+      ? { kind: 'team/lead-cleared', actor: actorFor(request, ctx.webServer.port), at: Date.now() }
+      : { kind: 'team/lead', memberId, actor: actorFor(request, ctx.webServer.port), at: Date.now() })
+    sendJson(response, 200, { ...(result.leadMemberId === undefined ? {} : { leadMemberId: result.leadMemberId }) })
   } catch (error) { if (mutationConflict(error)) sendJson(response, 409, { error: 'live-teams revision conflict' }); else sendJson(response, 500, { error: 'live-teams mutation failed' }) }
 }
 
@@ -2489,8 +2544,12 @@ export function registerLiveTeamsRoutes(ctx: LiveTeamsRouteContext, options: Liv
   registered.push(ctx.webServer.register({ kind: 'exact', path: LIVE_TEAMS_JOURNAL_ROUTE, handler: (request, response) => handleJournalList(request, response, ctx, options) }))
   registered.push(ctx.webServer.register({ kind: 'exact', path: LIVE_TEAMS_TASKS_ROUTE, handler: (request, response) => handleTasksList(request, response, ctx, options) }))
   registered.push(ctx.webServer.register({ kind: 'exact', path: LIVE_TEAMS_TASK_ROUTE, handler: (request, response) => handleTaskRead(request, response, ctx, options) }))
+  registered.push(ctx.webServer.register({ kind: 'exact', path: LIVE_TEAMS_TASK_NOTIFY_REVIEW_ROUTE, handler: (request, response) => handleTaskMutation(request, response, ctx, options, 'notify-review') }))
+  registered.push(ctx.webServer.register({ kind: 'exact', path: LIVE_TEAMS_TASK_NOTIFY_SUBMISSION_ROUTE, handler: (request, response) => handleTaskMutation(request, response, ctx, options, 'notify-submission') }))
   registered.push(ctx.webServer.register({ kind: 'exact', path: LIVE_TEAMS_TASK_ACCEPT_ROUTE, handler: (request, response) => handleTaskMutation(request, response, ctx, options, 'accept') }))
   registered.push(ctx.webServer.register({ kind: 'exact', path: LIVE_TEAMS_TASK_REVISE_ROUTE, handler: (request, response) => handleTaskMutation(request, response, ctx, options, 'revise') }))
+  registered.push(ctx.webServer.register({ kind: 'exact', path: LIVE_TEAMS_TASK_CANCEL_ROUTE, handler: (request, response) => handleTaskMutation(request, response, ctx, options, 'cancel') }))
+  registered.push(ctx.webServer.register({ kind: 'exact', path: LIVE_TEAMS_TASK_RESUME_ROUTE, handler: (request, response) => handleTaskMutation(request, response, ctx, options, 'resume') }))
   registered.push(ctx.webServer.register({ kind: 'exact', path: LIVE_TEAMS_TASK_CREATE_ROUTE, handler: (request, response) => handleTaskControl(request, response, ctx, options, 'create') }))
   registered.push(ctx.webServer.register({ kind: 'exact', path: LIVE_TEAMS_TASK_UPDATE_ROUTE, handler: (request, response) => handleTaskControl(request, response, ctx, options, 'update') }))
   registered.push(ctx.webServer.register({ kind: 'exact', path: LIVE_TEAMS_TASK_REVOKE_ROUTE, handler: (request, response) => handleTaskControl(request, response, ctx, options, 'revoke') }))

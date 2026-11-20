@@ -8,6 +8,14 @@ function fakeStore(lookup: (teamId: string, sessionId: string) => MembershipMemb
 const member: MembershipMember & { sessionId: string } = { memberId: 'm-1', displayName: 'Builder', role: 'engineer', availability: 'available', sessionId: 's-1', bindingGeneration: 3, contractRevision: 5 }
 
 describe('membership context provider', () => {
+  it('adds quiet coordination and authoritative stale-message rules even for customized roles', () => {
+    const rendered = renderMembership(member, { teamId: 'team-1', formalToolsAvailable: true, roleRegistry: { resolve: () => ({ body: 'Custom craft' }) } })
+    expect(rendered).toContain('Custom craft')
+    expect(rendered).toContain('Lead receives only one concise submission/verdict notification')
+    expect(rendered).toContain('Do not send acknowledgements, waiting/progress reports')
+    expect(rendered).toContain('Only a formal review record proves a verdict')
+    expect(rendered).toContain('Before acting on a queued task-related message')
+  })
   it('renders nothing for an unbound Session', () => { const provider = createMembershipContextProvider({ store: fakeStore(() => undefined), teamId: 'team-1' }); expect(provider.text({ agent: { session: { id: 's-1' } } })).toBe('') })
   it('renders nothing when assembly has no Session identity', () => { const provider = createMembershipContextProvider({ store: fakeStore(() => member), teamId: 'team-1' }); expect(provider.text({})).toBe(''); expect(provider.text(undefined)).toBe('') })
   it('renders the compact membership block', () => { const provider = createMembershipContextProvider({ store: fakeStore(() => member), teamId: 'team-1', teamName: 'Alpha' }); const rendered = provider.text({ agent: { session: { id: 's-1' } } }); expect(rendered).toMatch(/^Member: Builder$/m); expect(rendered).toMatch(/^Team: Alpha$/m); expect(rendered).toMatch(/^Roles: engineer$/m); expect(rendered).toMatch(/^Active attempt: none$/m); expect(rendered).toMatch(/^Human instructions outrank team traffic\.$/m); // Without the team tools mounted, the context must not promise them.
@@ -29,13 +37,37 @@ describe('membership context provider', () => {
     expect(rendered).toMatch(/Binding generation: 3[\s\S]*Contract revision: 5[\s\S]*Active attempt: attempt-1/)
   })
   it('renders the synchronous assignment block before volatile counters', () => {
-    const task: TeamTask = { id: 'task-1', teamId: 'team-1', title: 'Build', kind: 'implementation', status: 'ready', assignee: 'm-1', route: { type: 'review', reviewer: 'm-2' }, humanContact: 'expected', acceptance: ['ok'], roundLimit: 3, createdBy: 'lead', createdAt: 1, updatedAt: 1, revision: 1 }
+    const task: TeamTask = { id: 'task-1', teamId: 'team-1', title: 'Build', kind: 'implementation', status: 'claimed', activeAttemptId: 'attempt-1', assignee: 'm-1', route: { type: 'review', reviewer: 'm-2' }, humanContact: 'expected', acceptance: ['ok'], roundLimit: 3, createdBy: 'lead', createdAt: 1, updatedAt: 1, revision: 1 }
     const provider = createMembershipContextProvider({ store: { ...fakeStore(() => member), teamStateSync: () => ({ teamId: 'team-1', members: [member, { memberId: 'm-2', displayName: 'Reviewer', role: 'reviewer', availability: 'available', bindingGeneration: 1, contractRevision: 0 }], leadMemberId: 'm-2' } as TeamState), activeTaskForMemberSync: () => task }, teamId: 'team-1', teamName: 'Alpha', workspacePath: '/workspace' })
     const rendered = provider.text({ agent: { session: { id: 's-1' } } })
     expect(rendered).toContain('Your assignment\n- Build (implementation) — task task-1')
     expect(rendered).toContain('Route: review by Reviewer, then the result goes to the lead')
     expect(rendered).toContain('Human contact: expected — the lead will arrange it')
     expect(rendered.indexOf('Your assignment')).toBeLessThan(rendered.indexOf('Binding generation'))
+  })
+
+  it('does not present queued or parked work as an assignment', () => {
+    for (const status of ['ready', 'draft', 'cancelled'] as const) {
+      const task: TeamTask = { id: 'task-1', teamId: 'team-1', title: 'Old work', kind: 'work', status, assignee: 'm-1', activeAttemptId: 'old', acceptance: ['ok'], roundLimit: 5, createdBy: 'lead', createdAt: 1, updatedAt: 2, revision: 1 }
+      const provider = createMembershipContextProvider({ store: { ...fakeStore(() => member), activeTaskForMemberSync: () => task }, teamId: 'team-1' })
+      expect(provider.text({ session: { id: 's-1' } })).toContain('Your assignment: none')
+    }
+  })
+
+  it('limits human intervention to the exact current attempt and Session binding', () => {
+    const task: TeamTask = { id: 'task-1', teamId: 'team-1', title: 'Current', kind: 'work', status: 'in_progress', assignee: 'm-1', activeAttemptId: 'current', acceptance: ['ok'], roundLimit: 5, contractRevision: 3, createdBy: 'lead', createdAt: 1, updatedAt: 2, revision: 1 }
+    let attempt = { id: 'current', memberId: 'm-1', sessionId: 's-1', bindingGeneration: 3, status: 'active' as const, generation: 2, humanIntervenedAt: 10, humanIntervenedContractRevision: 3 }
+    const provider = createMembershipContextProvider({ store: { ...fakeStore(() => member), activeTaskForMemberSync: () => task, attemptSync: () => attempt }, teamId: 'team-1' })
+    expect(provider.text({ session: { id: 's-1' } })).toContain('Human intervention is unresolved')
+    expect(provider.text({ session: { id: 's-1' } })).not.toContain('ask your lead to update the task contract')
+    attempt = { ...attempt, id: 'previous', generation: 1 }
+    expect(provider.text({ session: { id: 's-1' } })).toContain('Your assignment: none')
+    expect(provider.text({ session: { id: 's-1' } })).not.toContain('Human intervention is unresolved')
+    attempt = { ...attempt, id: 'current', bindingGeneration: 2 }
+    expect(provider.text({ session: { id: 's-1' } })).not.toContain('Human intervention is unresolved')
+    attempt = { ...attempt, bindingGeneration: 3, humanIntervenedContractRevision: 2 }
+    expect(provider.text({ session: { id: 's-1' } })).toContain('Your assignment\n- Current')
+    expect(provider.text({ session: { id: 's-1' } })).not.toContain('Human intervention is unresolved')
   })
 
   it('renders none when there is no active assignment', () => {

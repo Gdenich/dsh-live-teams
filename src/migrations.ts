@@ -16,7 +16,30 @@ import { ERROR_CODES, LiveTeamsError } from './errors.js'
  */
 export type Migration = (state: unknown) => unknown
 
-export const MIGRATIONS: Readonly<Record<number, Migration>> = Object.freeze({})
+export const MIGRATIONS: Readonly<Record<number, Migration>> = Object.freeze({
+  /**
+   * 1 → 2: a task whose latest submission was never accepted is waiting for a decision.
+   *
+   * This is the best a single state can say: whether a *review* sent that submission back lives in
+   * the reviews file, which a migration does not see. A task returned by a reviewer therefore lands
+   * here too, and the panel offers accept or return with the rounds on screen — the human decides
+   * with the evidence in front of them, which is what they can already do with everything else.
+   */
+  1: (state) => {
+    const record = state !== null && typeof state === 'object' && !Array.isArray(state) ? state as Record<string, unknown> : undefined
+    if (record === undefined || !Array.isArray(record.tasks)) return state
+    return {
+      ...record,
+      tasks: record.tasks.map((entry) => {
+        const task = entry !== null && typeof entry === 'object' && !Array.isArray(entry) ? entry as Record<string, unknown> : undefined
+        if (task === undefined) return entry
+        const latest = task.latestSubmissionId
+        if (typeof latest !== 'string' || latest.length === 0 || task.acceptedSubmissionId === latest) return task
+        return { ...task, awaitsDecision: true }
+      }),
+    }
+  },
+})
 
 export type MigrationPlan =
   | { readonly kind: 'current' }

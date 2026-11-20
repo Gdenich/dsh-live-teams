@@ -1,3 +1,6 @@
+import { parseReviewReturn, type ReviewReturn } from '../review-return-state.js'
+export type { ReviewReturn } from '../review-return-state.js'
+
 export type TeamMember = {
   memberId: string
   note?: string
@@ -132,6 +135,7 @@ export type TaskRouteSummary =
   | { type: 'custom'; description: string }
 
 export type TeamTask = {
+  reviewReturn?: ReviewReturn
   id: string
   teamId: string
   title: string
@@ -157,6 +161,7 @@ export type TeamTask = {
 }
 
 export type TaskSummary = {
+  reviewReturn?: ReviewReturn
   id: string
   title: string
   status: TaskStatus
@@ -170,6 +175,8 @@ export type TaskSummary = {
   documentMissing?: boolean
   dependsOn?: string[]
   blockedBy?: Array<{ id: string; title: string; status: TaskStatus }>
+  /** A submission is in and nobody has decided on it. */
+  awaitsDecision?: boolean
   /** Declared write paths, so the contract form can be filled without a second read. */
   paths?: string[]
   checks?: string[]
@@ -227,6 +234,17 @@ export type TeamTaskAttempt = {
 }
 export type TeamTaskDetail = { task: TeamTask; document: string; documentMissing?: true; submissions: Submission[]; rounds: ReviewRound[]; attempts: TeamTaskAttempt[] }
 export type AcceptTaskResult = { task: TeamTask; archivedPath: string }
+export type CancelTaskResult = { task: TeamTask; archivedPath?: string; quiesced: boolean }
+export type PathWarning = { code: 'path-no-match' | 'path-scan-incomplete'; pattern: string; message: string }
+function pathWarnings(value: unknown): PathWarning[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new Error('invalid path warnings')
+  return value.map((item) => {
+    const entry = record(item)
+    if ((entry.code !== 'path-no-match' && entry.code !== 'path-scan-incomplete') || text(entry.pattern) === undefined || text(entry.message) === undefined) throw new Error('invalid path warning')
+    return { code: entry.code, pattern: entry.pattern as string, message: entry.message as string }
+  })
+}
 export type ReviseTaskResult = { task: TeamTask }
 
 /** The workspace folder action only exists after override created its folder. */
@@ -664,6 +682,7 @@ function task(value: unknown): TeamTask {
   if (entry.documentMissing !== undefined && typeof entry.documentMissing !== 'boolean') throw new Error('invalid team task response')
   return {
     id, teamId, title, kind, status,
+    ...(entry.reviewReturn === undefined ? {} : { reviewReturn: parseReviewReturn(entry.reviewReturn) }),
     ...(assignee === undefined ? {} : { assignee: String(assignee) }),
     ...(entry.route === undefined ? {} : { route: route(entry.route) as TaskRoute }),
     ...(humanContact === undefined ? {} : { humanContact }),
@@ -699,12 +718,16 @@ function taskSummary(value: unknown): TaskSummary {
   if (round !== undefined && !nonNegativeInteger(round) || roundLimit !== undefined && !nonNegativeInteger(roundLimit)) throw new Error('invalid team tasks response')
   const archivedPath = entry.archivedPath
   const documentMissing = entry.documentMissing
+  const awaitsDecision = entry.awaitsDecision
+  if (awaitsDecision !== undefined && typeof awaitsDecision !== 'boolean') throw new Error('invalid team tasks response')
   if (archivedPath !== undefined && text(archivedPath) === undefined || documentMissing !== undefined && typeof documentMissing !== 'boolean') throw new Error('invalid team tasks response')
   const dependsOn = entry.dependsOn
   if (dependsOn !== undefined && (!Array.isArray(dependsOn) || !dependsOn.every((item) => typeof item === 'string'))) throw new Error('invalid team tasks response')
   const blockedBy = entry.blockedBy === undefined ? undefined : taskBlockers(entry.blockedBy)
   return {
     id, title, status,
+    ...(entry.reviewReturn === undefined ? {} : { reviewReturn: parseReviewReturn(entry.reviewReturn) }),
+    ...(awaitsDecision === true ? { awaitsDecision: true } : {}),
     ...(assignee === undefined ? {} : { assignee: String(assignee) }),
     ...(assigneeName === undefined ? {} : { assigneeName: String(assigneeName) }),
     ...(entry.route === undefined ? {} : { route: summaryRoute(entry.route) as TaskRouteSummary }),
@@ -804,6 +827,15 @@ function acceptTaskResult(value: unknown): AcceptTaskResult {
   return { task: task(entry.task), archivedPath }
 }
 function reviseTaskResult(value: unknown): ReviseTaskResult { return { task: task(record(value).task) } }
+function cancelTaskResult(value: unknown): CancelTaskResult {
+  const entry = record(value)
+  const parsedTask = task(entry.task)
+  const archivedPath = text(entry.archivedPath)
+  if (typeof entry.quiesced !== 'boolean') throw new Error('invalid cancellation response')
+  if (entry.quiesced && (parsedTask.status !== 'cancelled' || archivedPath === undefined)) throw new Error('invalid completed cancellation')
+  if (!entry.quiesced && (parsedTask.status !== 'needs_human' || archivedPath !== undefined)) throw new Error('invalid pending cancellation')
+  return { task: parsedTask, quiesced: entry.quiesced, ...(archivedPath === undefined ? {} : { archivedPath }) }
+}
 
 async function requestJson(path: string, init: RequestInit): Promise<unknown> {
   const response = await fetch(path, { ...init, cache: 'no-store', credentials: 'same-origin', redirect: 'error', headers: { accept: 'application/json', ...(init.headers ?? {}) } })
@@ -811,7 +843,7 @@ async function requestJson(path: string, init: RequestInit): Promise<unknown> {
   try {
     body = await response.json() as unknown
   } catch {
-    throw new LiveTeamsApiError(response.status, 'invalid team response')
+    throw new LiveTeamsApiError(response.status, `invalid team response (HTTP ${response.status}; non-JSON body)`)
   }
   if (!response.ok) {
     const bodyRecord = record(body)
@@ -961,6 +993,30 @@ export async function fetchTeamTask(taskId: string, session?: string, signal?: A
 export async function acceptTeamTask(taskId: string, note?: string, session?: string): Promise<AcceptTaskResult> {
   const body = withSession({ taskId, ...(note === undefined ? {} : { note }) }, session)
   try { return acceptTaskResult(await requestJson('/api/live-teams/task/accept', { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify(body) })) } catch (cause: unknown) {
+    if (cause instanceof LiveTeamsApiError) throw cause
+    throw new LiveTeamsApiError(500, 'invalid team response')
+  }
+}
+
+/**
+ * Close a task by hand, without a submission.
+ *
+ * Accept needs a submission awaiting a decision; a task whose work was done by hand, dropped, or
+ * overtaken has none, and the panel offered no way to close it.
+ */
+export async function cancelTeamTask(taskId: string, reason: string, session?: string): Promise<CancelTaskResult> {
+  const body = withSession({ taskId, reason }, session)
+  try {
+    return cancelTaskResult(await requestJson('/api/live-teams/task/cancel', { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify(body) }))
+  } catch (cause) {
+    if (cause instanceof LiveTeamsApiError) throw cause
+    throw new LiveTeamsApiError(500, 'invalid team response')
+  }
+}
+
+export async function resumeTeamTask(taskId: string, session?: string): Promise<ReviseTaskResult> {
+  const body = withSession({ taskId }, session)
+  try { return reviseTaskResult(await requestJson('/api/live-teams/task/resume', { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify(body) })) } catch (cause: unknown) {
     if (cause instanceof LiveTeamsApiError) throw cause
     throw new LiveTeamsApiError(500, 'invalid team response')
   }
@@ -1157,18 +1213,40 @@ export type TaskControlDraft = {
   roundLimit?: number
 }
 
-export async function createTeamTask(draft: TaskControlDraft, session?: string): Promise<{ task: { id: string; title: string; status: string } }> {
-  return await requestJson('/api/live-teams/task/create', {
-    method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify(withSession(draft, session)),
-  }) as { task: { id: string; title: string; status: string } }
+export async function createTeamTask(draft: TaskControlDraft, session?: string): Promise<{ task: TeamTask; documentPath: string; warnings: PathWarning[] }> {
+  try {
+    const result = record(await requestJson('/api/live-teams/task/create', {
+      method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify(withSession(draft, session)),
+    }))
+    const documentPath = text(result.documentPath)
+    if (documentPath === undefined) throw new Error('invalid create response')
+    return { task: task(result.task), documentPath, warnings: pathWarnings(result.warnings) }
+  } catch (cause) {
+    if (cause instanceof LiveTeamsApiError) throw cause
+    throw new LiveTeamsApiError(500, 'invalid team response')
+  }
 }
 
-export async function updateTeamTask(request: { taskId: string; acceptance?: string[]; paths?: string[]; checks?: string[]; title?: string; assignee?: string; body?: string; expectedRevision?: number }, session?: string): Promise<MutationSuccess> {
-  return mutate(scoped('/api/live-teams/task/update', session), request)
+export async function updateTeamTask(request: { taskId: string; acceptance?: string[]; paths?: string[]; checks?: string[]; title?: string; assignee?: string; body?: string; expectedRevision?: number }, session?: string): Promise<{ task: TeamTask; document: string; changed: string[]; warnings: PathWarning[] }> {
+  try {
+    const result = record(await requestJson(scoped('/api/live-teams/task/update', session), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request) }))
+    if (typeof result.document !== 'string' || !Array.isArray(result.changed) || !result.changed.every((item) => typeof item === 'string')) throw new Error('invalid update response')
+    return { task: task(result.task), document: result.document, changed: result.changed as string[], warnings: pathWarnings(result.warnings) }
+  } catch (cause) {
+    if (cause instanceof LiveTeamsApiError) throw cause
+    throw new LiveTeamsApiError(500, 'invalid team response')
+  }
 }
 
-export async function revokeTeamTask(request: { taskId: string; reason: string }, session?: string): Promise<MutationSuccess> {
-  return mutate(scoped('/api/live-teams/task/revoke', session), request)
+export async function revokeTeamTask(request: { taskId: string; reason: string }, session?: string): Promise<{ task: TeamTask; attempt: TeamTaskAttempt; quiesced: boolean; reassigned: boolean }> {
+  try {
+    const result = record(await requestJson(scoped('/api/live-teams/task/revoke', session), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request) }))
+    if (typeof result.quiesced !== 'boolean' || typeof result.reassigned !== 'boolean') throw new Error('invalid revoke response')
+    return { task: task(result.task), attempt: taskAttempt(result.attempt), quiesced: result.quiesced, reassigned: result.reassigned }
+  } catch (cause) {
+    if (cause instanceof LiveTeamsApiError) throw cause
+    throw new LiveTeamsApiError(500, 'invalid team response')
+  }
 }
 
 export function addTeamMember(request: { sessionId: string; displayName: string; role: string; memberId?: string; expectedRevision: number }, session?: string): Promise<MutationSuccess> {
