@@ -141,8 +141,8 @@ Team state, tasks, submissions, reviews, and the activity journal are stored und
 
 - DSH Desktop **0.1.5-rc.1 or newer**.
 - **0.2.2-rc.1 is verified** with the native checks B37, B38, B41, and B42.
-- The plugin probes the host at mount, reports the result in its status, and logs a readable reason
-  when a required service is missing instead of assuming the host is unchanged.
+- The plugin checks the host at mount and reports the result in its status, so an incompatible host
+  is visible before work starts instead of failing one action at a time.
 - Sessions routed through the Claude Code MCP bridge receive the matching `mcp__dsh__live_team_*`
   tool names; the bridge itself is a separate package.
 
