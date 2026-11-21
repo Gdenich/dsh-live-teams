@@ -32,7 +32,15 @@ export async function atomicWrite(filePath: string, contents: string | Uint8Arra
     handle = undefined
     await fs.rename(temporaryPath, filePath)
     const directoryHandle = await fs.open(directory, 'r')
-    try { await directoryHandle.sync() } finally { await directoryHandle.close() }
+    try {
+      await directoryHandle.sync()
+    } catch (error) {
+      // Windows can open a directory but reject flushing its handle. The file
+      // itself has already been flushed and atomically renamed at this point.
+      if (process.platform !== 'win32' || (error as NodeJS.ErrnoException).code !== 'EPERM') throw error
+    } finally {
+      await directoryHandle.close()
+    }
   } finally {
     if (handle !== undefined) await handle.close().catch(() => undefined)
     await fs.unlink(temporaryPath).catch(() => undefined)
