@@ -187,7 +187,7 @@ DSH deployment or workspace level; the plugin does not fake it.
 
 ```bash
 pnpm --filter dsh-live-teams check   # host and client types
-pnpm --filter dsh-live-teams test    # 753 tests
+pnpm --filter dsh-live-teams test    # 754 tests
 pnpm --filter dsh-live-teams build   # host, client, declarations
 ```
 

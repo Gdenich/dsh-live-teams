@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -27,21 +27,43 @@ async function fixture(review = true) {
 }
 
 describe('durable lifecycle boundaries', () => {
- it.each(['lead-change', 'lead-binding-change'] as const)('does not deliver a stale PASS capability after %s', async scenario => {
+ it('does not retarget a PASS notice when a new lead is appointed', async () => {
+  const f = await fixture()
+  try {
+   await f.store.reviewTask({ taskId: f.taskId, submissionId: f.submitted.submission.id, reviewerMemberId: 'reviewer', verdict: 'pass', findings: [], evidence: [{ command: 'inspection-only', status: 'passed' }] })
+   const current = await f.team.open(); await f.team.commit('team-1', { expectedRevision: current.revision, mutate: draft => { draft.leadMemberId = 'reviewer' } })
+   await f.store.recoverLifecycleNotifications()
+   const recipients = f.deliverLifecycleNotice.mock.calls.map(call => call[0].recipient)
+   expect(recipients).toContain('lead')
+   expect(recipients).not.toContain('reviewer')
+  } finally { await f.cleanup() }
+ })
+ it('does not replay a legacy notice without an addressed lead', async () => {
+  const f = await fixture()
+  try {
+   await f.store.reviewTask({ taskId: f.taskId, submissionId: f.submitted.submission.id, reviewerMemberId: 'reviewer', verdict: 'pass', findings: [], evidence: [{ command: 'inspection-only', status: 'passed' }] })
+   const file = join(f.store.directoryPath, 'tasks.json')
+   const raw = JSON.parse(await readFile(file, 'utf8')) as { tasks: Array<{ lifecycleNotices?: Array<{ leadMemberId?: string }> }> }
+   for (const task of raw.tasks) for (const intent of task.lifecycleNotices ?? []) delete intent.leadMemberId
+   await writeFile(file, JSON.stringify(raw))
+   const calls = f.deliverLifecycleNotice.mock.calls.length
+   const current = await f.team.open(); await f.team.commit('team-1', { expectedRevision: current.revision, mutate: draft => { draft.leadMemberId = 'reviewer' } })
+   await f.store.recoverLifecycleNotifications()
+   expect(f.deliverLifecycleNotice.mock.calls.length).toBe(calls)
+  } finally { await f.cleanup() }
+ })
+ it('follows the same lead to a new binding after a binding change', async () => {
   const f = await fixture()
   try {
    f.deliverLifecycleNotice.mockImplementationOnce(async request => {
-    const current = await f.team.open(); await f.team.commit('team-1', { expectedRevision: current.revision, mutate: draft => {
-     if (scenario === 'lead-change') draft.leadMemberId = 'reviewer'
-     else { const lead = draft.members.find(member => member.memberId === 'lead')!; lead.sessionId = 's-lead-new'; lead.bindingGeneration++ }
-    } })
+    const current = await f.team.open(); await f.team.commit('team-1', { expectedRevision: current.revision, mutate: draft => { const lead = draft.members.find(member => member.memberId === 'lead')!; lead.sessionId = 's-lead-new'; lead.bindingGeneration++ } })
     expect(await request.stillCurrent()).toBe(false)
     return { recipient: request.recipient, purpose: request.intent.kind, state: 'superseded' }
    })
    const result = await f.store.reviewTask({ taskId: f.taskId, submissionId: f.submitted.submission.id, reviewerMemberId: 'reviewer', verdict: 'pass', findings: [], evidence: [{ command: 'inspection-only', status: 'passed' }] })
    expect(result.notifications?.[0]?.state).toBe('superseded')
    await f.store.recoverLifecycleNotifications()
-   expect(f.deliverLifecycleNotice.mock.calls.at(-1)?.[0]).toMatchObject(scenario === 'lead-change' ? { recipient: 'reviewer', sessionId: 's-reviewer' } : { recipient: 'lead', sessionId: 's-lead-new', bindingGeneration: 2 })
+   expect(f.deliverLifecycleNotice.mock.calls.at(-1)?.[0]).toMatchObject({ recipient: 'lead', sessionId: 's-lead-new', bindingGeneration: 2 })
   } finally { await f.cleanup() }
  })
  it.each(['new-submission', 'revoke'] as const)('fences a delayed manual direction after %s outside task locks', async scenario => {

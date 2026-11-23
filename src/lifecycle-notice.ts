@@ -6,6 +6,8 @@ export type LifecycleNoticeKind = 'review-verdict' | 'acceptance' | 'cancellatio
 export interface LifecycleNoticeIntent {
  id: string; kind: LifecycleNoticeKind; contractRevision: number
  roundId?: string; submissionId?: string; assignee?: string; attemptId?: string; text?: string
+ /** The lead this verdict was addressed to. Snapshotted so a later lead never inherits history. */
+ leadMemberId?: string
 }
 export interface LifecycleNoticeRequest {
  taskId: string; intent: LifecycleNoticeIntent; recipient: string; sessionId: string; bindingGeneration: number; content: string
@@ -25,6 +27,7 @@ export function validateLifecycleNotices(value: unknown): asserts value is Lifec
   kinds.add(item.kind)
   const fields = item.kind === 'review-verdict' ? ['roundId', 'submissionId'] : item.kind === 'acceptance' ? ['submissionId', 'assignee'] : item.kind === 'direction' ? ['assignee', 'attemptId', 'text'] : ['assignee', 'text']
   if (fields.some(key => typeof item[key] !== 'string' || !item[key])) throw new LiveTeamsError(ERROR_CODES.STATE_CORRUPT, 'incomplete lifecycle notification intent')
+  if (item.leadMemberId !== undefined && (typeof item.leadMemberId !== 'string' || item.leadMemberId.length === 0)) throw new LiveTeamsError(ERROR_CODES.STATE_CORRUPT, 'invalid lifecycle notification recipient')
  }
 }
 const PREFIX = 'lifecycle-notice/v1:'

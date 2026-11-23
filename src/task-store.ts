@@ -1347,10 +1347,14 @@ export class TaskStore {
       let authorBinding: { sessionId: string; bindingGeneration: number } | undefined
       let detail = ''
       if (intent.kind === 'review-verdict') {
+        // A legacy intent has no recorded recipient. Re-resolving the current lead here is what
+        // replayed every historical PASS to a newly appointed lead; an unaddressed notice is
+        // superseded instead. New intents always carry the lead who was in office at the verdict.
+        if (intent.leadMemberId === undefined) return undefined
         const rounds = (await this.readReviewsIfPresentLocked()).rounds.filter(entry => entry.taskId === taskId).sort((a, b) => a.round - b.round)
         const round = rounds.at(-1)
         if (round === undefined || round.id !== intent.roundId || round.submissionId !== intent.submissionId || task.latestSubmissionId !== intent.submissionId || !['pass', 'escalate'].includes(round.verdict) || round.verdict === 'pass' && (task.status !== 'completed' || task.acceptedSubmissionId !== intent.submissionId) || round.verdict === 'escalate' && !['waiting', 'needs_human'].includes(task.status)) return undefined
-        recipient = resolveLeadMemberId(team)
+        recipient = intent.leadMemberId
         detail = `Формальный вердикт: ${round.verdict.toUpperCase()}, раунд ${round.round} (${round.id}).\nSubmission: ${round.submissionId}.\n${round.verdict === 'pass' ? 'Работа уже принята по PASS и задача завершена; повторная приёмка не требуется.' : 'Reviewer запросил решение Lead; прочитай формальные findings перед решением.'}\nЗамечаний: ${round.findings.length}. Полные findings и evidence — в формальном вердикте.`
       } else if (intent.kind === 'acceptance') {
         if (task.status !== 'completed' || task.acceptedSubmissionId !== intent.submissionId) return undefined
@@ -1397,7 +1401,7 @@ export class TaskStore {
 
   async recoverLifecycleNotifications(limit = 8): Promise<void> {
     if (this.deliverLifecycleNotice === undefined) return
-    const candidates = await withProcessLock(this.location.teamFile, async () => (await this.readTasksIfPresentLocked()).tasks.flatMap(task => (task.lifecycleNotices ?? []).map(intent => ({ taskId: task.id, intentId: intent.id, kind: intent.kind }))))
+    const candidates = await withProcessLock(this.location.teamFile, async () => (await this.readTasksIfPresentLocked()).tasks.flatMap(task => (task.lifecycleNotices ?? []).filter(intent => intent.kind !== 'review-verdict' || intent.leadMemberId !== undefined).map(intent => ({ taskId: task.id, intentId: intent.id, kind: intent.kind }))))
     const count = Math.min(candidates.length, Math.max(1, limit))
     for (let i = 0; i < count; i++) { const next = candidates[(this.lifecycleCursor + i) % candidates.length]!; await this.processLifecycleNotification(next.taskId, next.intentId, next.kind) }
     this.lifecycleCursor = candidates.length === 0 ? 0 : (this.lifecycleCursor + count) % candidates.length
@@ -1411,8 +1415,9 @@ export class TaskStore {
       const task = tasks.tasks.find(entry => entry.id === taskId)
       const round = (await this.readReviewsIfPresentLocked()).rounds.filter(entry => entry.taskId === taskId).sort((a, b) => a.round - b.round).at(-1)
       if (task === undefined || round?.id !== roundId || task.latestSubmissionId !== round.submissionId || !['pass', 'escalate'].includes(round.verdict) || round.verdict === 'pass' && (task.status !== 'completed' || task.acceptedSubmissionId !== round.submissionId) || round.verdict === 'escalate' && !['waiting', 'needs_human'].includes(task.status)) fail('verdict no longer matches current task outcome')
-      if (task.lifecycleNotices?.some(intent => intent.kind === 'review-verdict' && intent.roundId === roundId)) return
-      const next = withLifecycleIntent(task, lifecycleIntent('review-verdict', task.contractRevision ?? 0, { roundId, submissionId: round.submissionId }))
+      const leadMemberId = resolveLeadMemberId(team)
+      if (task.lifecycleNotices?.some(intent => intent.kind === 'review-verdict' && intent.roundId === roundId && intent.leadMemberId === leadMemberId)) return
+      const next = withLifecycleIntent(task, lifecycleIntent('review-verdict', task.contractRevision ?? 0, { roundId, submissionId: round.submissionId, ...(leadMemberId === undefined ? {} : { leadMemberId }) }))
       await atomicWriteJson(this.location.file, { ...tasks, revision: tasks.revision + 1, tasks: tasks.tasks.map(entry => entry.id === taskId ? { ...next, revision: task.revision + 1, updatedAt: Date.now() } : entry) })
       await this.appendAudit({ kind: 'review/notification-requested', taskId, roundId, actor, at: Date.now() })
     })
@@ -1677,6 +1682,10 @@ export class TaskStore {
       // for evidence and the store accepted an empty list anyway). An inspection counts — record the
       // command you ran, even if it only reads the diff or opens the artifact.
       if (request.verdict === 'pass' && evidence.length === 0) fail('PASS needs at least one recorded check: run the verification and record the command with its output, so the verdict can be reproduced later')
+      // The notice belongs to the lead who is in office when the verdict is recorded. Resolving
+      // it again during recovery would retarget every historical PASS to a newly appointed lead.
+      const team = await this.readTeamLocked()
+      const verdictLeadMemberId = resolveLeadMemberId(team)
       const priorRounds = reviews.rounds.filter((entry) => entry.taskId === task.id)
       const roundNumber = priorRounds.length + 1
       if (request.verdict === 'needs_revision' && priorRounds.filter((entry) => entry.verdict === 'needs_revision').length >= task.roundLimit) fail(`round limit ${task.roundLimit} reached; escalate to the lead instead`)
@@ -1701,7 +1710,7 @@ export class TaskStore {
       // (found while scripting the B31 run; F17).
       if (request.verdict === 'pass') nextTask = { ...nextTask, acceptedSubmissionId: submission.id, status: 'completed', contractRevision: (task.contractRevision ?? 0) + 1 }
       else if (request.verdict === 'escalate') nextTask = { ...nextTask, status: 'waiting' }
-      if (request.verdict === 'pass' || request.verdict === 'escalate') nextTask = withLifecycleIntent(nextTask, lifecycleIntent('review-verdict', nextTask.contractRevision ?? 0, { roundId: round.id, submissionId: submission.id }))
+      if (request.verdict === 'pass' || request.verdict === 'escalate') nextTask = withLifecycleIntent(nextTask, lifecycleIntent('review-verdict', nextTask.contractRevision ?? 0, { roundId: round.id, submissionId: submission.id, ...(verdictLeadMemberId === undefined ? {} : { leadMemberId: verdictLeadMemberId }) }))
       // A reviewer's PASS completes the task, so the attempt that produced it ends here.
       // Leaving it active made the member look permanently busy to the dispatcher (the
       // first live run found exactly that) and kept the intervention observer watching a
@@ -1735,7 +1744,7 @@ export class TaskStore {
       audit.push({ kind: 'review/round', taskId: task.id, submissionId: submission.id, reviewerMemberId: request.reviewerMemberId, verdict: request.verdict, round: round.round, at: now, revision: nextReviews.revision })
       if (request.verdict === 'pass') audit.push({ kind: 'task/accepted', taskId: task.id, submissionId: submission.id, actor: request.reviewerMemberId, at: now, revision: tasks.revision + 1 })
       if (request.verdict === 'escalate') {
-        const leadMemberId = leadMemberIdForMessage(await this.readTeamLocked())
+        const leadMemberId = verdictLeadMemberId ?? leadMemberIdForMessage(team)
         const problem = findings.map((finding) => finding.problem).join('; ') || 'reviewer escalated without a finding'
         const tried = findings.map((finding) => finding.requiredFix).join('; ') || 'review evidence recorded'
         audit.push({ kind: 'review/escalated', taskId: task.id, submissionId: submission.id, reviewerMemberId: request.reviewerMemberId, leadMemberId, problem, tried, at: now, revision: nextReviews.revision })

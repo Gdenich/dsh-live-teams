@@ -11,6 +11,8 @@ export interface LifecycleNoticeIntent {
   assignee?: string;
   attemptId?: string;
   text?: string;
+  /** The lead this verdict was addressed to. Snapshotted so a later lead never inherits history. */
+  leadMemberId?: string;
 }
 export interface LifecycleNoticeRequest {
   taskId: string;
