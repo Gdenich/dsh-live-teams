@@ -68,6 +68,18 @@ describe('B19 durable task store', () => {
     } finally { await cleanup(value.workspace) }
   })
 
+  it('accepts a route encoded as a JSON string by the model transport', async () => {
+    const value = await fresh()
+    try {
+      const encoded = '{"type":"review","reviewer":"reviewer"}' as unknown as CreateTaskRequest['route']
+      const created = await value.store.createTask(request({ route: encoded }))
+      expect(created.task.route).toEqual({ type: 'review', reviewer: 'reviewer' })
+      const updated = await value.store.updateTask({ taskId: created.task.id, actor: 'lead', route: '{"type":"report","to":"human"}' as unknown as NonNullable<UpdateTaskRequest['route']> })
+      expect(updated.task.route).toEqual({ type: 'report', to: 'human' })
+      await expect(value.store.createTask(request({ route: 'review' as unknown as CreateTaskRequest['route'] }))).rejects.toThrow(/route must be a report/u)
+    } finally { await cleanup(value.workspace) }
+  })
+
   it('creates a draft task when either assignee or route is absent', async () => {
     const value = await fresh()
     try {

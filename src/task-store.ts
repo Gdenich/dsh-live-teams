@@ -613,12 +613,27 @@ function isLeadOrHuman(team: TeamState, actor: string): boolean {
 
 function leadMemberIdForMessage(team: TeamState): string { return team.leadMemberId ?? team.members.find((member) => member.role === 'lead')?.memberId ?? 'the lead' }
 
+/**
+ * Models do not all emit tool arguments with the declared JSON shape: one provider sends `route` as
+ * a JSON-encoded string while the schema asks for an object. Parse that representation here so the
+ * contract is still validated exactly, instead of rejecting an otherwise correct route by its
+ * transport encoding.
+ */
+function routeObject(route: unknown): Record<string, unknown> | undefined {
+  const direct = objectRecord(route)
+  if (direct !== undefined) return direct
+  if (typeof route !== 'string') return undefined
+  const encoded = route.trim()
+  if (!encoded.startsWith('{') || !encoded.endsWith('}')) return undefined
+  try { return objectRecord(JSON.parse(encoded)) } catch { return undefined }
+}
+
 function validateRoute(route: unknown, team: TeamState, assignee: string | undefined): TaskRoute {
   // The portable protocol describes `interactive → human, then reviewer`. The transitions implement
   // `report` and `review` only, so a task with the nested shape could never be completed: it is
   // refused where it is written, with the working alternative named.
-  if (objectRecord(route)?.type === 'interactive') fail('the interactive route shape is not implemented: use {"type":"review","reviewer":"<member id>"} or {"type":"report","to":"human"}')
-  const value = objectRecord(route)
+  if (routeObject(route)?.type === 'interactive') fail('the interactive route shape is not implemented: use {"type":"review","reviewer":"<member id>"} or {"type":"report","to":"human"}')
+  const value = routeObject(route)
   if (value === undefined || typeof value.type !== 'string') fail('route must be a report, review, interactive, or custom route')
   if (value.type === 'report') {
     if (value.to !== 'human' && (typeof value.to !== 'string' || memberById(team, value.to) === undefined)) fail('report route must name a current member or human')
